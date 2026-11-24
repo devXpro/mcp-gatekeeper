@@ -1,0 +1,32 @@
+[
+  {
+    "_id": {
+      "$oid": "6b05d716201f126d8d7c5f1e"
+    },
+    "at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    },
+    "account_id": "acc_fixture1",
+    "actor": "per_owner",
+    "action": "oauth.consent",
+    "target": "notes",
+    "detail": {
+      "client": "ChatGPT",
+      "scope": "mcp"
+    },
+    "ip": "203.0.113.5"
+  },
+  {
+    "_id": {
+      "$oid": "6b05d716201f126d8d7c5f1f"
+    },
+    "at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    },
+    "action": "setup.link"
+  }
+]

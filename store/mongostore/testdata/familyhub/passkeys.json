@@ -1,0 +1,51 @@
+[
+  {
+    "_id": "pk_1",
+    "person_id": "per_owner",
+    "credential_id": {
+      "$binary": {
+        "base64": "AQID",
+        "subType": "00"
+      }
+    },
+    "data": {
+      "$binary": {
+        "base64": "eyJpZCI6IkFRSUQifQ==",
+        "subType": "00"
+      }
+    },
+    "name": "iPhone",
+    "created_at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    },
+    "last_used_at": {
+      "$date": {
+        "$numberLong": "2082888672345"
+      }
+    }
+  },
+  {
+    "_id": "pk_2",
+    "person_id": "per_member",
+    "credential_id": {
+      "$binary": {
+        "base64": "BAU=",
+        "subType": "00"
+      }
+    },
+    "data": {
+      "$binary": {
+        "base64": "e30=",
+        "subType": "00"
+      }
+    },
+    "name": "",
+    "created_at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    }
+  }
+]

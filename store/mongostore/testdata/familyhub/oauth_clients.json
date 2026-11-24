@@ -1,0 +1,51 @@
+[
+  {
+    "_id": "cli_dcr",
+    "kind": "dcr",
+    "assistant": "chatgpt",
+    "name": "ChatGPT",
+    "redirect_uris": [
+      "https://chatgpt.com/connector_platform_oauth_redirect"
+    ],
+    "auth_method": "client_secret_post",
+    "secret_hash": {
+      "$binary": {
+        "base64": "c2VjcmV0LWhhc2g=",
+        "subType": "00"
+      }
+    },
+    "fetched_at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    },
+    "created_at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    },
+    "last_used_at": {
+      "$date": {
+        "$numberLong": "2082885072345"
+      }
+    }
+  },
+  {
+    "_id": "https://claude.ai/oauth/claude-code-client-metadata",
+    "kind": "cimd",
+    "assistant": "claude",
+    "name": "Claude",
+    "redirect_uris": [],
+    "auth_method": "none",
+    "fetched_at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    },
+    "created_at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    }
+  }
+]

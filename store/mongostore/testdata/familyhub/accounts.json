@@ -1,0 +1,11 @@
+[
+  {
+    "_id": "acc_fixture1",
+    "name": "Kowalscy",
+    "created_at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    }
+  }
+]

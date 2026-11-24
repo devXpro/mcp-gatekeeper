@@ -1,0 +1,79 @@
+[
+  {
+    "_id": "inv_member",
+    "token_hash": {
+      "$binary": {
+        "base64": "dG9rLW1lbWJlcg==",
+        "subType": "00"
+      }
+    },
+    "kind": "member",
+    "account_id": "acc_fixture1",
+    "name": "Bella",
+    "created_by": "per_owner",
+    "created_at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    },
+    "expires_at": {
+      "$date": {
+        "$numberLong": "2083140672345"
+      }
+    },
+    "used_at": {
+      "$date": {
+        "$numberLong": "2082885072345"
+      }
+    }
+  },
+  {
+    "_id": "inv_owner",
+    "token_hash": {
+      "$binary": {
+        "base64": "dG9rLW93bmVy",
+        "subType": "00"
+      }
+    },
+    "kind": "owner",
+    "account_id": "acc_fixture1",
+    "name": "Owner",
+    "created_by": "per_owner",
+    "created_at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    },
+    "expires_at": {
+      "$date": {
+        "$numberLong": "2083140672345"
+      }
+    },
+    "revoked_at": {
+      "$date": {
+        "$numberLong": "2082885072345"
+      }
+    }
+  },
+  {
+    "_id": "inv_setup",
+    "token_hash": {
+      "$binary": {
+        "base64": "dG9rLXNldHVw",
+        "subType": "00"
+      }
+    },
+    "kind": "setup",
+    "name": "",
+    "created_at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    },
+    "expires_at": {
+      "$date": {
+        "$numberLong": "2082882372345"
+      }
+    }
+  }
+]

@@ -1,0 +1,75 @@
+[
+  {
+    "_id": {
+      "$binary": {
+        "base64": "YWNjZXNzLTE=",
+        "subType": "00"
+      }
+    },
+    "grant_id": "grt_active",
+    "kind": "access",
+    "family": "fam-1",
+    "created_at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    },
+    "expires_at": {
+      "$date": {
+        "$numberLong": "2082885072345"
+      }
+    }
+  },
+  {
+    "_id": {
+      "$binary": {
+        "base64": "cmVmcmVzaC0x",
+        "subType": "00"
+      }
+    },
+    "grant_id": "grt_active",
+    "kind": "refresh",
+    "family": "fam-1",
+    "created_at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    },
+    "expires_at": {
+      "$date": {
+        "$numberLong": "2085473472345"
+      }
+    },
+    "used_at": {
+      "$date": {
+        "$numberLong": "2082881532345"
+      }
+    }
+  },
+  {
+    "_id": {
+      "$binary": {
+        "base64": "cmVmcmVzaC0y",
+        "subType": "00"
+      }
+    },
+    "grant_id": "grt_revoked",
+    "kind": "refresh",
+    "family": "fam-2",
+    "created_at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    },
+    "expires_at": {
+      "$date": {
+        "$numberLong": "2085473472345"
+      }
+    },
+    "revoked_at": {
+      "$date": {
+        "$numberLong": "2082885072345"
+      }
+    }
+  }
+]

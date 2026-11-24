@@ -1,0 +1,26 @@
+[
+  {
+    "_id": {
+      "$binary": {
+        "base64": "Y29kZS0x",
+        "subType": "00"
+      }
+    },
+    "grant_id": "grt_active",
+    "client_id": "cli_dcr",
+    "redirect_uri": "https://chatgpt.com/connector_platform_oauth_redirect",
+    "resource": "https://family.example.com/mcp/notes",
+    "scope": "mcp",
+    "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+    "created_at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    },
+    "expires_at": {
+      "$date": {
+        "$numberLong": "2082881772345"
+      }
+    }
+  }
+]

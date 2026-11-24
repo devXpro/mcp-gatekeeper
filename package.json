@@ -1,0 +1,90 @@
+{
+  "name": "@devxpro/mcp-gatekeeper-ui",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "The admin web UI of MCP Gatekeeper as TSX sources: the design system and the shared screens (sign-in, setup, join, consent, connect, account, passkeys, audit, the shell). Applications compile it with their own Vite.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/devXpro/mcp-gatekeeper.git"
+  },
+  "engines": {
+    "node": ">=22.22.0"
+  },
+  "sideEffects": [
+    "*.css"
+  ],
+  "exports": {
+    ".": "./ui/src/index.ts",
+    "./styles.css": "./ui/src/styles/index.css",
+    "./tokens.css": "./ui/src/styles/tokens.css",
+    "./i18n/ru.json": "./ui/src/i18n/ru.json",
+    "./i18n/en.json": "./ui/src/i18n/en.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "ui/src",
+    "!ui/src/**/*.test.ts",
+    "!ui/src/**/*.test.tsx",
+    "!ui/src/test",
+    "ui/README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc -b --noEmit",
+    "lint": "eslint --max-warnings 0 .",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "peerDependencies": {
+    "@simplewebauthn/browser": "^14.0.0",
+    "@tanstack/react-query": "^5.107.1",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "i18next": "^27.1.2",
+    "lucide-react": "^1.73.0",
+    "motion": "^14.14.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-i18next": "^18.0.1",
+    "react-router": "^8.5.1",
+    "tailwind-merge": "^3.7.0",
+    "tailwindcss": "^4.3.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@simplewebauthn/browser": "14.0.0",
+    "@tanstack/react-query": "5.107.1",
+    "@testing-library/dom": "10.4.2",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.3",
+    "@testing-library/user-event": "14.6.10",
+    "@types/node": "24.19.2",
+    "@types/qrcode": "1.5.6",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.3.0",
+    "class-variance-authority": "0.7.1",
+    "clsx": "2.1.1",
+    "eslint": "10.15.0",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "eslint-plugin-react-refresh": "0.5.8",
+    "globals": "17.14.0",
+    "i18next": "27.1.2",
+    "jsdom": "31.0.1",
+    "lucide-react": "1.73.0",
+    "motion": "14.14.0",
+    "qrcode": "1.5.4",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "react-i18next": "18.0.1",
+    "react-router": "8.5.1",
+    "tailwind-merge": "3.7.0",
+    "tailwindcss": "4.3.5",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.2",
+    "vite": "8.3.8",
+    "vitest": "5.1.0"
+  }
+}

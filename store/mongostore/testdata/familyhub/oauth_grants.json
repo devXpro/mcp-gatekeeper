@@ -1,0 +1,39 @@
+[
+  {
+    "_id": "grt_active",
+    "person_id": "per_owner",
+    "account_id": "acc_fixture1",
+    "client_id": "cli_dcr",
+    "module_id": "notes",
+    "scope": "mcp",
+    "created_at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    },
+    "revoked_at": null
+  },
+  {
+    "_id": "grt_revoked",
+    "person_id": "per_member",
+    "account_id": "acc_fixture1",
+    "client_id": "https://claude.ai/oauth/claude-code-client-metadata",
+    "module_id": "photos",
+    "scope": "mcp offline_access",
+    "created_at": {
+      "$date": {
+        "$numberLong": "2082881472345"
+      }
+    },
+    "last_used_at": {
+      "$date": {
+        "$numberLong": "2082881532345"
+      }
+    },
+    "revoked_at": {
+      "$date": {
+        "$numberLong": "2082885072345"
+      }
+    }
+  }
+]

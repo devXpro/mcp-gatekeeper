@@ -1,0 +1,24 @@
+[
+  {
+    "_id": {
+      "$numberInt": "1"
+    },
+    "name": "collections and indexes",
+    "applied_at": {
+      "$date": {
+        "$numberLong": "1795544854645"
+      }
+    }
+  },
+  {
+    "_id": {
+      "$numberInt": "2"
+    },
+    "name": "audit retention",
+    "applied_at": {
+      "$date": {
+        "$numberLong": "1795544854651"
+      }
+    }
+  }
+]

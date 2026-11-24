@@ -1,0 +1,22 @@
+# Build output
+/bin/
+/dist/
+coverage.out
+
+# Node (the ui package)
+node_modules/
+/ui/dist/
+test-results/
+playwright-report/
+
+# Local workspaces and editors
+go.work
+go.work.sum
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets never live in this repo
+.env
+.env.*
+*.pem
