@@ -75,18 +75,18 @@ func (s *Server) serverMetadata(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) resourceMetadata(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.resourceAt(strings.TrimPrefix(r.URL.Path, wellKnownResource))
 	if !ok {
-		apiError(w, http.StatusNotFound, httpsec.CodeNotFound, "no such module")
+		apiError(w, http.StatusNotFound, httpsec.CodeNotFound, "no such "+s.noun)
 		return
 	}
 	_, err := s.liveResource(r.Context(), id)
 	switch {
 	case errors.Is(err, errNoResource):
-		apiError(w, http.StatusNotFound, httpsec.CodeNotFound, "no such module")
+		apiError(w, http.StatusNotFound, httpsec.CodeNotFound, "no such "+s.noun)
 		return
 	case err != nil:
 		s.log.Error("oauth: protected-resource metadata failed", slog.String("resource", string(id)),
 			slog.Any("error", err))
-		apiError(w, http.StatusInternalServerError, httpsec.CodeInternal, "the module registry failed")
+		apiError(w, http.StatusInternalServerError, httpsec.CodeInternal, "the "+s.noun+" registry failed")
 		return
 	}
 	writeJSON(w, http.StatusOK, resourceMetadataDoc{

@@ -11,9 +11,19 @@ import (
 	"github.com/devXpro/mcp-gatekeeper/core"
 )
 
+// errEnded refuses an access token the server knows but that has ended: it is past its expiry (which is never past
+// its person's term) or revoked, or its grant is revoked or outlived grantTTL. It is core.ErrInvalidToken and
+// core.ErrExpired both (review GK-12): the MCP access check answers the same 401, but charges no failure to the
+// client's address, since an assistant holding a stale token guessed nothing.
+var errEnded = fmt.Errorf("%w: %w", core.ErrInvalidToken, core.ErrExpired)
+
 // ValidateAccess implements core.TokenValidator. token must be a live access token, found by its sha256, whose grant
-// is active, younger than grantTTL, and for resource r. Any other token is core.ErrInvalidToken. A store failure is
-// returned as itself, so the MCP access check can answer 5xx rather than send the assistant to sign in again.
+// is active, younger than grantTTL, and for resource r. A known access token that has ended is errEnded; any other
+// token is a bare core.ErrInvalidToken. A store failure is returned as itself, so the MCP access check can answer 5xx
+// rather than send the assistant to sign in again.
+//
+// It reads no person: a term reaches it as the token's expiry, and the MCP access check refuses a person who is not
+// active, as it refuses a disabled one.
 //
 // It also records the grant's last use, at most once a minute, for the connections list.
 func (s *Server) ValidateAccess(ctx context.Context, token string, r core.ResourceID) (core.AccessInfo, error) {
@@ -26,14 +36,20 @@ func (s *Server) ValidateAccess(ctx context.Context, token string, r core.Resour
 	if err != nil {
 		return invalidOr(err)
 	}
-	if t.Kind != core.TokenAccess || t.RevokedAt != nil || !now.Before(t.ExpiresAt) {
+	switch {
+	case t.Kind != core.TokenAccess:
 		return core.AccessInfo{}, core.ErrInvalidToken
+	case t.RevokedAt != nil, !now.Before(t.ExpiresAt):
+		return core.AccessInfo{}, errEnded
 	}
 	g, err := o.GetGrant(ctx, t.GrantID)
 	if err != nil {
 		return invalidOr(err)
 	}
-	if g.RevokedAt != nil || g.ResourceID != r || grantExpired(g, now) {
+	switch {
+	case g.RevokedAt != nil, grantExpired(g, now):
+		return core.AccessInfo{}, errEnded
+	case g.ResourceID != r:
 		return core.AccessInfo{}, core.ErrInvalidToken
 	}
 	client, err := o.GetClient(ctx, g.ClientID)

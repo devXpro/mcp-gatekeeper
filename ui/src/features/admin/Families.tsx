@@ -6,6 +6,7 @@ import { useTranslation } from 'react-i18next'
 import { InviteLink } from '../../components/invite'
 import { Button } from '../../components/ui/button'
 import { TextField } from '../../components/ui/controls'
+import { features } from '../../config'
 import { ErrorState, SkeletonRows } from '../../components/ui/feedback'
 import { Row, Section } from '../../components/ui/list'
 import { Sheet, SheetFooter } from '../../components/ui/sheet'
@@ -24,9 +25,14 @@ import type { AdminAccount, AdminAccountCreated } from '../../lib/types'
 
 // The superadmin's families (Family Hub /admin, DESIGN.md §8.7): only names and counts, never their data; create one
 // with its owner's invite link, or delete one by typing its name. The application puts this section on its own admin
-// page (Family Hub: above the modules) and keeps that page behind AdminOnly.
+// page (Family Hub: above the modules) and keeps that page behind AdminOnly. A single-account application
+// (configure({ singleAccount: true })) has no families to show: the section renders nothing and asks for nothing.
 
 export function FamiliesSection() {
+  return features().singleAccount ? null : <Families />
+}
+
+function Families() {
   const { t } = useTranslation()
   const lang = useLang()
   const accounts = useAdminAccounts()

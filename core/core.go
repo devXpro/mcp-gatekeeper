@@ -12,8 +12,10 @@ import (
 	"crypto/rand"
 	"encoding/base32"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -77,6 +79,22 @@ type Person struct {
 	Superadmin bool // manages accounts and the application; never sees other accounts' data
 	CreatedAt  time.Time
 	DisabledAt *time.Time
+	// AccessUntil ends the person's access at that instant (a guest's term); nil means no end. Only an application
+	// that offers terms sets it (package people, with a PermissionCatalog).
+	AccessUntil *time.Time
+	// Permissions are application-defined ids of what the person may use (e.g. PermissionAll, "plugin:tv"); nil means
+	// the application's default. The gatekeeper checks them against the application's PermissionCatalog and stores
+	// them; it never interprets them.
+	Permissions []string
+}
+
+// PermissionAll is the permission id for everything an application offers, now and later. An owner has it.
+const PermissionAll = "all"
+
+// Active reports whether p may act at now: not disabled, and before the end of their term if they have one. Every
+// check of a session, an access token, a refresh and a consent uses it.
+func (p Person) Active(now time.Time) bool {
+	return p.DisabledAt == nil && (p.AccessUntil == nil || now.Before(*p.AccessUntil))
 }
 
 // Passkey is a stored WebAuthn credential. Data belongs to package auth (the credential as JSON).
@@ -107,7 +125,7 @@ type InviteKind string
 // Invite kinds.
 const (
 	InviteSetup  InviteKind = "setup"  // the first superadmin and their account (CLI only)
-	InviteOwner  InviteKind = "owner"  // the owner of a new account, made by the superadmin
+	InviteOwner  InviteKind = "owner"  // an owner: of a new account, or a co-owner of an existing one; by the superadmin
 	InviteMember InviteKind = "member" // a member of an existing account, made by its owner
 )
 
@@ -123,6 +141,10 @@ type Invite struct {
 	ExpiresAt time.Time
 	UsedAt    *time.Time
 	RevokedAt *time.Time
+	// AccessUntil and Permissions are copied to the person who redeems a member invite, in the same transaction (see
+	// Person). ExpiresAt is the link's life; AccessUntil is the person's.
+	AccessUntil *time.Time
+	Permissions []string
 }
 
 // Assistant is the AI product behind an OAuth client.
@@ -248,10 +270,49 @@ type Site struct {
 	ClientIP  ClientIPMode
 }
 
+// Validate reports whether s can be served (review GK-2):
+//   - PublicURL is https with a host and nothing after it; plain http only for localhost or a loopback address;
+//   - RPID, when set, is that host or a parent domain of it (package auth requires it to be set);
+//   - ClientIP is one of the known modes; an empty or unknown mode would silently mean the TCP peer, which behind a
+//     local connector is every client at once.
+//
+// Every constructor that takes a Site calls it, so a mistake fails at start.
+func (s Site) Validate() error {
+	u, err := url.Parse(s.PublicURL)
+	// ForceQuery and a bare "#" are an empty query or fragment the parsed fields would not show; a port alone
+	// ("https://:443") has a Host but no hostname.
+	if err != nil || u.Host == "" || u.Hostname() == "" || u.Opaque != "" || u.User != nil || u.Path != "" ||
+		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(s.PublicURL, "#") {
+		return fmt.Errorf("site: the public URL %q must be scheme://host[:port] and nothing more", s.PublicURL)
+	}
+	host := u.Hostname()
+	switch u.Scheme {
+	case "https":
+	case "http":
+		if ip := net.ParseIP(host); host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			return fmt.Errorf("site: the public URL %q uses plain http, which is only for localhost", s.PublicURL)
+		}
+	default:
+		return fmt.Errorf("site: the public URL %q must be https", s.PublicURL)
+	}
+	if s.RPID != "" && s.RPID != host && !strings.HasSuffix(host, "."+s.RPID) {
+		return fmt.Errorf("site: the RP ID %q is neither the host %q nor a parent domain of it", s.RPID, host)
+	}
+	switch s.ClientIP {
+	case ClientIPCloudflare, ClientIPForwarded, ClientIPRemote:
+		return nil
+	default:
+		return fmt.Errorf("site: the client address mode %q is not %q, %q or %q", s.ClientIP, ClientIPCloudflare,
+			ClientIPForwarded, ClientIPRemote)
+	}
+}
+
 // ClientIP returns the client address of r under mode, falling back to the TCP peer.
 //
 // The application must make sure only a trusted peer can set the header that mode reads (Family Hub deletes
-// CF-Connecting-IP and X-Forwarded-For from any peer outside its edge network before this runs).
+// CF-Connecting-IP and X-Forwarded-For from any peer outside its edge network before this runs). A request without
+// the header falls back to the TCP peer: in a header mode only the trusted connector should reach the listener (a
+// local connector: listen on loopback only), or every such request shares one address.
 func ClientIP(r *http.Request, mode ClientIPMode) string {
 	switch mode {
 	case ClientIPCloudflare:

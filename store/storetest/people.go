@@ -1,6 +1,8 @@
 package storetest
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -112,6 +114,93 @@ func testPeople(t *testing.T, open Open) {
 	_, err = s.People().Get(ctx, member.ID)
 	assert.ErrorIs(t, err, core.ErrNotFound)
 }
+
+func testPersonAccess(t *testing.T, open Open) {
+	ctx := t.Context()
+	s := open(t)
+	a := seedAccount(t, s, "Family")
+	now := ms()
+	until := now.Add(48 * time.Hour)
+
+	// A person created with a term and permissions reads back with both, in the order given, as UTC.
+	guest := core.Person{ID: "per_guest", AccountID: a.ID, Name: "Carol", Role: core.RoleMember, CreatedAt: now,
+		AccessUntil: &until, Permissions: []string{"plugin:tv", "plugin:lights"}}
+	require.NoError(t, s.People().Create(ctx, guest))
+	got, err := s.People().Get(ctx, guest.ID)
+	require.NoError(t, err)
+	assert.Equal(t, guest, got)
+	require.NotNil(t, got.AccessUntil)
+	assert.Equal(t, time.UTC, got.AccessUntil.Location())
+	list, err := s.People().ListByAccount(ctx, a.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []core.Person{guest}, list)
+
+	// No permissions, whether nil or empty, is nil.
+	plain := core.Person{ID: "per_plain", AccountID: a.ID, Name: "Bob", Role: core.RoleMember, CreatedAt: now.Add(time.Second),
+		Permissions: []string{}}
+	require.NoError(t, s.People().Create(ctx, plain))
+	got, err = s.People().Get(ctx, plain.ID)
+	require.NoError(t, err)
+	assert.Nil(t, got.Permissions)
+	assert.Nil(t, got.AccessUntil)
+
+	// SetAccess replaces the term and the permissions together.
+	later := until.Add(24 * time.Hour).In(time.FixedZone("X", 3*3600))
+	require.NoError(t, s.People().SetAccess(ctx, guest.ID, &later, []string{PermissionTV}))
+	got, err = s.People().Get(ctx, guest.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.AccessUntil)
+	assert.True(t, later.Equal(*got.AccessUntil))
+	assert.Equal(t, time.UTC, got.AccessUntil.Location())
+	assert.Equal(t, []string{PermissionTV}, got.Permissions)
+	assert.Equal(t, "Carol", got.Name, "nothing else changes")
+	assert.Nil(t, got.DisabledAt)
+
+	// nil clears the term, nil or no permissions clear the permissions: each on its own.
+	require.NoError(t, s.People().SetAccess(ctx, guest.ID, nil, []string{PermissionTV, core.PermissionAll}))
+	got, err = s.People().Get(ctx, guest.ID)
+	require.NoError(t, err)
+	assert.Nil(t, got.AccessUntil)
+	assert.Equal(t, []string{PermissionTV, core.PermissionAll}, got.Permissions)
+	require.NoError(t, s.People().SetAccess(ctx, guest.ID, &until, []string{}))
+	got, err = s.People().Get(ctx, guest.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.AccessUntil)
+	assert.True(t, until.Equal(*got.AccessUntil))
+	assert.Nil(t, got.Permissions)
+	require.NoError(t, s.People().SetAccess(ctx, guest.ID, nil, nil))
+	got, err = s.People().Get(ctx, guest.ID)
+	require.NoError(t, err)
+	assert.Equal(t, core.Person{ID: guest.ID, AccountID: a.ID, Name: "Carol", Role: core.RoleMember, CreatedAt: now}, got,
+		"clearing both leaves a person as if they never had a term")
+	require.NoError(t, s.People().SetAccess(ctx, guest.ID, nil, nil), "clearing twice is fine")
+
+	// Active follows the term and the disabled mark, with the person as stored.
+	require.NoError(t, s.People().SetAccess(ctx, guest.ID, &until, nil))
+	got, err = s.People().Get(ctx, guest.ID)
+	require.NoError(t, err)
+	assert.True(t, got.Active(until.Add(-time.Millisecond)))
+	assert.False(t, got.Active(until), "the term ends at AccessUntil")
+
+	assert.ErrorIs(t, s.People().SetAccess(ctx, "per_missing", &until, nil), core.ErrNotFound)
+	assert.ErrorIs(t, s.People().SetAccess(ctx, "per_missing", nil, nil), core.ErrNotFound)
+
+	// It joins the transaction of its context: a rollback undoes it.
+	errRollBack := errors.New("roll back")
+	err = s.Tx(ctx, func(ctx context.Context) error {
+		if err := s.People().SetAccess(ctx, guest.ID, nil, []string{"x"}); err != nil {
+			return err
+		}
+		return errRollBack
+	})
+	require.ErrorIs(t, err, errRollBack)
+	got, err = s.People().Get(ctx, guest.ID)
+	require.NoError(t, err)
+	assert.Nil(t, got.Permissions)
+}
+
+// PermissionTV is a permission id the tests use; the gatekeeper never interprets ids.
+const PermissionTV = "plugin:tv"
 
 func testPasskeys(t *testing.T, open Open) {
 	ctx := t.Context()

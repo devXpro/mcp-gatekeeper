@@ -60,8 +60,27 @@ type PersonStore interface {
 	CountSuperadmins(ctx context.Context) (int, error)
 	Rename(ctx context.Context, id core.PersonID, name string) error
 	Disable(ctx context.Context, id core.PersonID, at time.Time) error
+	// SetAccess replaces a person's term and permissions (core.Person.AccessUntil and Permissions; nil clears each).
+	SetAccess(ctx context.Context, id core.PersonID, until *time.Time, perms []string) error
 	// Delete removes the person with their passkeys, sessions, grants and tokens, then runs the registered Cascades.
 	Delete(ctx context.Context, id core.PersonID) error
+}
+
+// Purger is implemented by an adapter whose database cannot expire rows by itself (sqlitestore; MongoDB has TTL
+// indexes, so mongostore does not need it). The application's sweeper calls it, e.g. hourly.
+type Purger interface {
+	// Purge deletes what has expired at now under the adapter's retention: tokens and codes past their end, invites
+	// some days after theirs, audit entries past the retention, and DCR clients without a grant.
+	Purge(ctx context.Context, now time.Time) (PurgeStats, error)
+}
+
+// PurgeStats counts what one Purge deleted.
+type PurgeStats struct {
+	Tokens  int
+	Codes   int
+	Invites int
+	Audit   int
+	Clients int
 }
 
 // PasskeyStore keeps passkeys.

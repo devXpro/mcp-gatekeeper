@@ -108,6 +108,43 @@ func testInvites(t *testing.T, open Open) {
 	assert.ErrorIs(t, err, core.ErrUsed, "a used invite is not revoked by RevokeKind")
 }
 
+func testInviteAccess(t *testing.T, open Open) {
+	ctx := t.Context()
+	s := open(t)
+	now := ms()
+	a := seedAccount(t, s, "Family")
+	until := now.Add(72 * time.Hour)
+	guest := core.Invite{ID: "inv_guest", TokenHash: hash("guest"), Kind: core.InviteMember, AccountID: a.ID, Name: "Carol",
+		CreatedBy: "per_x", CreatedAt: now, ExpiresAt: now.Add(time.Hour), AccessUntil: &until,
+		Permissions: []string{PermissionTV, "plugin:lights"}}
+	require.NoError(t, s.Invites().Create(ctx, guest))
+	plain := core.Invite{ID: "inv_plain", TokenHash: hash("plain"), Kind: core.InviteMember, AccountID: a.ID, Name: "Bob",
+		CreatedBy: "per_x", CreatedAt: now.Add(time.Second), ExpiresAt: now.Add(time.Hour), Permissions: []string{}}
+	require.NoError(t, s.Invites().Create(ctx, plain))
+
+	got, err := s.Invites().Peek(ctx, guest.TokenHash, now)
+	require.NoError(t, err)
+	assert.Equal(t, guest, got)
+	require.NotNil(t, got.AccessUntil)
+	assert.Equal(t, time.UTC, got.AccessUntil.Location())
+
+	got, err = s.Invites().Peek(ctx, plain.TokenHash, now)
+	require.NoError(t, err)
+	assert.Nil(t, got.Permissions, "no permissions, nil or empty, is nil")
+	assert.Nil(t, got.AccessUntil)
+
+	list, err := s.Invites().ListByAccount(ctx, a.ID)
+	require.NoError(t, err)
+	plain.Permissions = nil
+	assert.Equal(t, []core.Invite{guest, plain}, list)
+
+	// Consume hands both over, so the redeemer can copy them to the person in the same transaction.
+	used, err := s.Invites().Consume(ctx, guest.TokenHash, now)
+	require.NoError(t, err)
+	assert.True(t, until.Equal(*used.AccessUntil))
+	assert.Equal(t, guest.Permissions, used.Permissions)
+}
+
 func testInviteConsumeConcurrent(t *testing.T, open Open) {
 	ctx := t.Context()
 	s := open(t)

@@ -277,6 +277,7 @@ func (r people) Create(ctx context.Context, p core.Person) error {
 		return fmt.Errorf("fake person %q: %w", p.ID, core.ErrConflict)
 	}
 	p.CreatedAt, p.DisabledAt = ms(p.CreatedAt), msPtr(p.DisabledAt)
+	p.AccessUntil, p.Permissions = msPtr(p.AccessUntil), slices.Clone(p.Permissions)
 	r.s.d.people[p.ID] = p
 	return nil
 }
@@ -339,6 +340,17 @@ func (r people) Disable(ctx context.Context, id core.PersonID, at time.Time) err
 		return notFound("person")
 	}
 	p.DisabledAt = msPtr(&at)
+	r.s.d.people[id] = p
+	return nil
+}
+
+func (r people) SetAccess(ctx context.Context, id core.PersonID, until *time.Time, perms []string) error {
+	defer r.s.lock(ctx)()
+	p, ok := r.s.d.people[id]
+	if !ok {
+		return notFound("person")
+	}
+	p.AccessUntil, p.Permissions = msPtr(until), slices.Clone(perms)
 	r.s.d.people[id] = p
 	return nil
 }
@@ -518,6 +530,7 @@ func (r invites) Create(ctx context.Context, inv core.Invite) error {
 		return fmt.Errorf("fake invite %q: %w", inv.ID, core.ErrConflict)
 	}
 	inv.CreatedAt, inv.ExpiresAt = ms(inv.CreatedAt), ms(inv.ExpiresAt)
+	inv.AccessUntil, inv.Permissions = msPtr(inv.AccessUntil), slices.Clone(inv.Permissions)
 	r.s.d.invites[inv.ID] = inv
 	return nil
 }

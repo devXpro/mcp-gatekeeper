@@ -30,8 +30,9 @@ const guardCSP = "default-src 'none'; frame-ancestors 'none'; sandbox"
 type fakeTokens struct {
 	mu      sync.Mutex
 	tokens  map[string]core.AccessInfo
-	err     error // returned for every token when set
-	lenient bool  // hand out a token whatever resource it is for (to test the guard's own check)
+	dead    map[string]error // tokens the validator knows and refuses with their error (expired, revoked)
+	err     error            // returned for every token when set
+	lenient bool             // hand out a token whatever resource it is for (to test the guard's own check)
 }
 
 func (f *fakeTokens) ValidateAccess(_ context.Context, token string, r core.ResourceID) (core.AccessInfo, error) {
@@ -39,6 +40,9 @@ func (f *fakeTokens) ValidateAccess(_ context.Context, token string, r core.Reso
 	defer f.mu.Unlock()
 	if f.err != nil {
 		return core.AccessInfo{}, f.err
+	}
+	if err, ok := f.dead[token]; ok {
+		return core.AccessInfo{}, err
 	}
 	info, ok := f.tokens[token]
 	if !ok || (!f.lenient && info.ResourceID != r) {
@@ -159,6 +163,27 @@ func (u *fakeUpstream) only(t *testing.T) upstreamRequest {
 	return got[0]
 }
 
+// fakeClock is a core.Clock that moves only when told to.
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) Set(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = t
+}
+
+// start is the harness clock's time; the guests' terms are set around it.
+var start = time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+
 // passed is what the guard handed the application's handler.
 type passed struct {
 	access core.AccessInfo
@@ -177,6 +202,7 @@ type harness struct {
 	client    *http.Client // the assistant's
 	proxied   *http.Client // the application's, to the MCP server
 	logs      *testlog.Recorder
+	clock     *fakeClock
 
 	mu    sync.Mutex
 	calls []passed
@@ -185,8 +211,11 @@ type harness struct {
 // harnessOptions change a harness.
 type harnessOptions struct {
 	paths    core.ResourcePaths // nil: core.PerResource{Prefix: "/mcp/"}
-	clientIP core.ClientIPMode
+	clientIP core.ClientIPMode  // "": core.ClientIPRemote
 	ping     time.Duration
+	brand    core.Brand
+	inFlight int
+	key      InFlightKey // PerPerson: the proxy admits with AdmitAccess, as Homie does
 }
 
 func newHarness(t *testing.T, o harnessOptions) *harness {
@@ -194,14 +223,22 @@ func newHarness(t *testing.T, o harnessOptions) *harness {
 	if o.paths == nil {
 		o.paths = core.PerResource{Prefix: "/mcp/"}
 	}
+	if o.clientIP == "" {
+		o.clientIP = core.ClientIPRemote
+	}
 	disabled := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	termLeft, termOver := start.Add(time.Hour), start.Add(-time.Minute)
 	h := &harness{
 		people: &fakePeople{people: map[core.PersonID]core.Person{
 			"per_alice": {ID: "per_alice", AccountID: "acc_a", Name: "Alice", Role: core.RoleOwner},
 			"per_bella": {ID: "per_bella", AccountID: "acc_a", Name: "Bella", Role: core.RoleMember},
 			"per_off":   {ID: "per_off", AccountID: "acc_a", Name: "Gone Away", Role: core.RoleMember, DisabledAt: &disabled},
 			"per_bob":   {ID: "per_bob", AccountID: "acc_b", Name: "Bob", Role: core.RoleOwner},
+			"per_carol": {ID: "per_carol", AccountID: "acc_a", Name: "Carol", Role: core.RoleMember,
+				AccessUntil: &termLeft, Permissions: []string{"plugin:tv"}},
+			"per_erin": {ID: "per_erin", AccountID: "acc_a", Name: "Erin", Role: core.RoleMember, AccessUntil: &termOver},
 		}},
+		clock: &fakeClock{now: start},
 		resources: &fakeResources{on: map[core.AccountID][]core.ResourceID{
 			"acc_a": {"hello", "other", "home"},
 			"acc_b": {"other"},
@@ -222,13 +259,15 @@ func newHarness(t *testing.T, o harnessOptions) *harness {
 		"tok-bob":       access("per_bob", "acc_b", "hello", core.AssistantChatGPT),
 		"tok-bob-other": access("per_bob", "acc_b", "other", core.AssistantChatGPT),
 		"tok-home":      access("per_alice", "acc_a", "home", core.AssistantClaude),
+		"tok-carol":     access("per_carol", "acc_a", "hello", core.AssistantChatGPT),
+		"tok-erin":      access("per_erin", "acc_a", "hello", core.AssistantChatGPT),
 	}}
 	log, rec := testlog.New()
 	h.logs = rec
 	g, err := New(Options{
 		Site:  core.Site{PublicURL: hubURL, ClientIP: o.clientIP},
-		Paths: o.paths, Tokens: h.tokens, People: h.people, Resources: h.resources,
-		PingInterval: o.ping, Log: log,
+		Paths: o.paths, Tokens: h.tokens, People: h.people, Resources: h.resources, Brand: o.brand,
+		PingInterval: o.ping, InFlightPerResource: o.inFlight, InFlightKey: o.key, Log: log, Clock: h.clock.Now,
 	})
 	require.NoError(t, err)
 	h.guard = g
@@ -257,7 +296,11 @@ func (h *harness) proxy(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	h.calls = append(h.calls, passed{access: info, person: person})
 	h.mu.Unlock()
-	release, ok := h.guard.Admit(w, info.AccountID, info.ResourceID)
+	admit := func() (func(), bool) { return h.guard.Admit(w, info.AccountID, info.ResourceID) }
+	if h.guard.perPerson {
+		admit = func() (func(), bool) { return h.guard.AdmitAccess(w, info) }
+	}
+	release, ok := admit()
 	if !ok {
 		return
 	}

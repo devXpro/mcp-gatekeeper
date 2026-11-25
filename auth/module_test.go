@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -31,7 +32,7 @@ func TestWiring(t *testing.T) {
 	reg := adminsock.NewRegistry()
 	require.NoError(t, reg.Add(adminsock.Command{Name: "status", Summary: "the application's own",
 		Run: func(context.Context, adminsock.Invocation) error { return nil }}))
-	a, err := New(Options{Site: core.Site{PublicURL: testOrigin}, Brand: testBrand, Store: st, Admin: reg,
+	a, err := New(Options{Site: testSite, Brand: testBrand, Store: st, Admin: reg,
 		AdminCLI: "hub admin"})
 	require.NoError(t, err)
 	var sessions core.Sessions = a
@@ -53,6 +54,12 @@ func TestWiring(t *testing.T) {
 	var out bytes.Buffer
 	require.NoError(t, c.Run(ctx, "setup-link", nil, nil, &out))
 	assert.Contains(t, out.String(), testOrigin+"/setup#t=")
+	// The audit names the socket's peer: this test process (review GK-5), and who started it (review R-5).
+	entries := st.Audit().(fakeAudit).entries()
+	require.NotEmpty(t, entries)
+	assert.Equal(t, strconv.Itoa(os.Getpid()), entries[len(entries)-1].Detail["peer_pid"])
+	assert.NotEmpty(t, entries[len(entries)-1].Detail["peer_exe"])
+	assert.Contains(t, entries[len(entries)-1].Detail["peer_chain"], " (pid "+strconv.Itoa(os.Getppid())+")")
 	// Through the CLI: a second link is fine while nobody registered; a superadmin with a passkey blocks it.
 	cli := adminsock.CLI{Socket: path, Prog: "hub admin", App: "hub"}
 	var stdout, stderr bytes.Buffer
@@ -81,7 +88,7 @@ func TestWiring(t *testing.T) {
 	require.NoError(t, a.Stop(ctx), "a second stop is a no-op")
 
 	// A registry that already holds auth's commands refuses a second Auth.
-	_, err = New(Options{Site: core.Site{PublicURL: testOrigin}, Brand: testBrand, Store: st, Admin: reg})
+	_, err = New(Options{Site: testSite, Brand: testBrand, Store: st, Admin: reg})
 	require.ErrorContains(t, err, "registered twice")
 }
 
@@ -103,28 +110,38 @@ func TestStartStop(t *testing.T) {
 
 func TestNew(t *testing.T) {
 	st := newFakeStore()
-	_, err := New(Options{Site: core.Site{PublicURL: testOrigin}, Brand: testBrand})
+	_, err := New(Options{Site: testSite, Brand: testBrand})
 	require.Error(t, err, "a store is required")
+	remote := core.ClientIPRemote
 	for _, site := range []core.Site{
-		{PublicURL: ""},
-		{PublicURL: "hub.example.com"},
-		{PublicURL: "ftp://hub.example.com"},
-		{PublicURL: "https://hub.example.com/path"},
-		{PublicURL: "https://hub.example.com?q=1"},
-		{PublicURL: "https://user@hub.example.com"},
-		{PublicURL: "https://hub.example.com", RPID: "other.example.com"},
-		{PublicURL: "https://hub.example.com", RPID: "ub.example.com"},
+		{PublicURL: "", ClientIP: remote},
+		{PublicURL: "hub.example.com", ClientIP: remote},
+		{PublicURL: "ftp://hub.example.com", ClientIP: remote},
+		{PublicURL: "https://hub.example.com/path", ClientIP: remote},
+		{PublicURL: "https://hub.example.com/", ClientIP: remote},
+		{PublicURL: "https://hub.example.com?q=1", ClientIP: remote},
+		{PublicURL: "https://user@hub.example.com", ClientIP: remote},
+		{PublicURL: "https://hub.example.com", RPID: "other.example.com", ClientIP: remote},
+		{PublicURL: "https://hub.example.com", RPID: "ub.example.com", ClientIP: remote},
+		{PublicURL: "http://hub.example.com", ClientIP: remote},
+		// Review GK-2: no client address mode, or an unknown one, would silently mean the TCP peer.
+		{PublicURL: "https://hub.example.com"},
+		{PublicURL: "https://hub.example.com", ClientIP: "cf-connecting"},
 	} {
 		_, err := New(Options{Site: site, Brand: testBrand, Store: st})
 		require.Error(t, err, "%+v", site)
 	}
+	_, err = New(Options{Site: core.Site{PublicURL: testOrigin, ClientIP: "x-real-ip"}, Brand: testBrand, Store: st})
+	require.ErrorContains(t, err, "client address mode")
 	for _, tc := range []struct {
 		in       core.Site
 		url, rpi string
 	}{
-		{core.Site{PublicURL: "https://Hub.Example.com/"}, "https://hub.example.com", "hub.example.com"},
-		{core.Site{PublicURL: "https://hub.example.com", RPID: "example.com"}, "https://hub.example.com", "example.com"},
-		{core.Site{PublicURL: "http://localhost:5173"}, "http://localhost:5173", "localhost"},
+		{core.Site{PublicURL: "https://Hub.Example.com", ClientIP: remote}, "https://hub.example.com", "hub.example.com"},
+		{core.Site{PublicURL: "https://hub.example.com", RPID: "example.com", ClientIP: core.ClientIPForwarded},
+			"https://hub.example.com", "example.com"},
+		{core.Site{PublicURL: "http://localhost:5173", ClientIP: remote}, "http://localhost:5173", "localhost"},
+		{core.Site{PublicURL: testOrigin, ClientIP: core.ClientIPCloudflare}, testOrigin, testHost},
 	} {
 		a, err := New(Options{Site: tc.in, Brand: testBrand, Store: st})
 		require.NoError(t, err, "%+v", tc.in)
@@ -132,7 +149,7 @@ func TestNew(t *testing.T) {
 		assert.Equal(t, tc.rpi, a.site.RPID)
 	}
 	// Without a clock the system clock is used, in UTC.
-	a, err := New(Options{Site: core.Site{PublicURL: testOrigin}, Brand: testBrand, Store: st})
+	a, err := New(Options{Site: testSite, Brand: testBrand, Store: st})
 	require.NoError(t, err)
 	assert.Equal(t, time.UTC, a.now().Location())
 	assert.WithinDuration(t, time.Now(), a.now(), time.Minute)
@@ -148,7 +165,7 @@ func TestNew(t *testing.T) {
 		{Product: product, SessionCookie: cookieName, CSRFHeader: "X-Семья"},
 		{Product: " ", SessionCookie: cookieName, CSRFHeader: csrfHeader},
 	} {
-		_, err := New(Options{Site: core.Site{PublicURL: testOrigin}, Brand: b, Store: st})
+		_, err := New(Options{Site: testSite, Brand: b, Store: st})
 		require.Error(t, err, "%+v", b)
 	}
 	// Reset steps need a key, a phrase and a Run, and a key of their own.
@@ -160,7 +177,7 @@ func TestNew(t *testing.T) {
 		{{Key: "grants", Phrase: "grants", Run: run}},
 		{{Key: "keys", Phrase: "keys", Run: run}, {Key: "keys", Phrase: "more keys", Run: run}},
 	} {
-		_, err := New(Options{Site: core.Site{PublicURL: testOrigin}, Brand: testBrand, Store: st, ResetSteps: steps})
+		_, err := New(Options{Site: testSite, Brand: testBrand, Store: st, ResetSteps: steps})
 		require.Error(t, err, "%+v", steps)
 	}
 }
@@ -170,7 +187,7 @@ func TestProductName(t *testing.T) {
 	st := newFakeStore()
 	brand := testBrand
 	brand.Product = "Homie"
-	a, err := New(Options{Site: core.Site{PublicURL: testOrigin}, Brand: brand, Store: st})
+	a, err := New(Options{Site: testSite, Brand: brand, Store: st})
 	require.NoError(t, err)
 	mux := http.NewServeMux()
 	a.RegisterRoutes(mux)
@@ -186,7 +203,7 @@ func TestProductName(t *testing.T) {
 
 func TestNormalizeName(t *testing.T) {
 	for in, want := range map[string]string{
-		"  Мой шалаш \t":              "Мой шалаш",
+		"  Наш дом \t":                "Наш дом",
 		"«Семья»":                     "«Семья»",
 		"Alice's":                     "Alice's",
 		"🏠 Дача 2":                    "🏠 Дача 2",

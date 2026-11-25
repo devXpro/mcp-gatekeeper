@@ -4,34 +4,46 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/devXpro/mcp-gatekeeper/core"
 )
 
-const inviteCols = `id, token_hash, kind, account_id, name, created_by, created_at, expires_at, used_at, revoked_at`
+const inviteCols = `id, token_hash, kind, account_id, name, created_by, created_at, expires_at, used_at, revoked_at, access_until, permissions`
 
 func scanInvite(r scanner) (core.Invite, error) {
 	var (
 		inv                    core.Invite
 		kind, account, creator string
 		created, expires       int64
-		used, revoked          sql.NullInt64
+		used, revoked, until   sql.NullInt64
+		perms                  sql.NullString
 	)
-	if err := r.Scan(&inv.ID, &inv.TokenHash, &kind, &account, &inv.Name, &creator, &created, &expires, &used, &revoked); err != nil {
+	if err := r.Scan(&inv.ID, &inv.TokenHash, &kind, &account, &inv.Name, &creator, &created, &expires, &used, &revoked,
+		&until, &perms); err != nil {
 		return core.Invite{}, err
 	}
 	inv.Kind, inv.AccountID, inv.CreatedBy = core.InviteKind(kind), core.AccountID(account), core.PersonID(creator)
 	inv.CreatedAt, inv.ExpiresAt, inv.UsedAt, inv.RevokedAt = fromMS(created), fromMS(expires), optTime(used), optTime(revoked)
+	inv.AccessUntil = optTime(until)
+	var err error
+	if inv.Permissions, err = decodePermissions(perms); err != nil {
+		return core.Invite{}, fmt.Errorf("permissions of invite %q: %w", inv.ID, err)
+	}
 	return inv, nil
 }
 
 type invites struct{ s *Store }
 
 func (i invites) Create(ctx context.Context, inv core.Invite) error {
-	_, err := i.s.exec(ctx, "create invite", `INSERT INTO gk_invites (`+inviteCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	perms, err := encodePermissions(inv.Permissions)
+	if err != nil {
+		return wrap("create invite", err)
+	}
+	_, err = i.s.exec(ctx, "create invite", `INSERT INTO gk_invites (`+inviteCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		inv.ID, blob(inv.TokenHash), string(inv.Kind), string(inv.AccountID), inv.Name, string(inv.CreatedBy),
-		ms(inv.CreatedAt), ms(inv.ExpiresAt), optMS(inv.UsedAt), optMS(inv.RevokedAt))
+		ms(inv.CreatedAt), ms(inv.ExpiresAt), optMS(inv.UsedAt), optMS(inv.RevokedAt), optMS(inv.AccessUntil), perms)
 	return err
 }
 

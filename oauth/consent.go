@@ -59,8 +59,8 @@ type consentCall struct {
 	info   core.ResourceInfo
 }
 
-// txnInfo is GET /api/oauth/txn/{txn}: what the consent screen shows. It needs a session and the browser that
-// started the transaction, and the resource must be available to the viewer's account (403 otherwise).
+// txnInfo is GET /api/oauth/txn/{txn}: what the consent screen shows. It needs a session of an active person and the
+// browser that started the transaction, and the resource must be available to the viewer's account (403 otherwise).
 func (s *Server) txnInfo(w http.ResponseWriter, r *http.Request) {
 	call, ok := s.consentCall(w, r)
 	if !ok {
@@ -70,7 +70,7 @@ func (s *Server) txnInfo(w http.ResponseWriter, r *http.Request) {
 	g, err := s.store.OAuth().FindGrant(r.Context(), v.Person.ID, t.clientID, t.resource)
 	if err != nil && !errors.Is(err, core.ErrNotFound) {
 		s.log.Error("oauth: reading a grant failed", slog.Any("error", err))
-		apiError(w, http.StatusInternalServerError, httpsec.CodeInternal, "the hub's store failed")
+		apiError(w, http.StatusInternalServerError, httpsec.CodeInternal, "the "+s.app+"'s store failed")
 		return
 	}
 	tools := make([]toolView, 0, len(call.info.Tools))
@@ -111,7 +111,7 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.log.Error("oauth: reading a client failed", slog.Any("error", err))
-		apiError(w, http.StatusInternalServerError, httpsec.CodeInternal, "the hub's store failed")
+		apiError(w, http.StatusInternalServerError, httpsec.CodeInternal, "the "+s.app+"'s store failed")
 		return
 	}
 	now := s.now()
@@ -132,7 +132,7 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		s.log.Error("oauth: storing a consent failed", slog.Any("error", err))
 		apiError(w, http.StatusInternalServerError, httpsec.CodeInternal,
-			"the hub's store failed; start connecting again")
+			"the "+s.app+"'s store failed; start connecting again")
 		return
 	}
 	noStore(w)
@@ -159,8 +159,12 @@ func (s *Server) deny(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// consentCall resolves the viewer and the transaction of a consent API call (boundTxn), answering 404 when its
-// resource can no longer be connected and 403 when it is not available to the viewer's account.
+// consentCall resolves the viewer and the transaction of a consent API call (boundTxn), answering 401 no_session when
+// the viewer may no longer act (core.Person.Active), 404 when its resource can no longer be connected and 403 when it
+// is not available to the viewer's account.
+//
+// Package auth already refuses the session of a person who is not active, with the same 401; the check here covers
+// another core.Sessions and a term that ends while the call runs.
 func (s *Server) consentCall(w http.ResponseWriter, r *http.Request) (consentCall, bool) {
 	ctx := r.Context()
 	t, ok := s.boundTxn(w, r)
@@ -168,24 +172,28 @@ func (s *Server) consentCall(w http.ResponseWriter, r *http.Request) (consentCal
 		return consentCall{}, false
 	}
 	v, _ := core.ViewerFrom(ctx)
+	if !v.Person.Active(s.now()) {
+		apiError(w, http.StatusUnauthorized, httpsec.CodeNoSession, "your access has ended")
+		return consentCall{}, false
+	}
 	info, err := s.liveResource(ctx, t.resource)
 	switch {
 	case errors.Is(err, errNoResource):
-		apiError(w, http.StatusNotFound, httpsec.CodeNotFound, "the module is not available")
+		apiError(w, http.StatusNotFound, httpsec.CodeNotFound, "the "+s.noun+" is not available")
 		return consentCall{}, false
 	case err != nil:
 		s.log.Error("oauth: reading a resource failed", slog.Any("error", err))
-		apiError(w, http.StatusInternalServerError, httpsec.CodeInternal, "the module registry failed")
+		apiError(w, http.StatusInternalServerError, httpsec.CodeInternal, "the "+s.noun+" registry failed")
 		return consentCall{}, false
 	}
 	available, err := s.catalog.Available(ctx, v.Account.ID, t.resource)
 	switch {
 	case err != nil:
 		s.log.Error("oauth: reading whether a resource is available failed", slog.Any("error", err))
-		apiError(w, http.StatusInternalServerError, httpsec.CodeInternal, "the module registry failed")
+		apiError(w, http.StatusInternalServerError, httpsec.CodeInternal, "the "+s.noun+" registry failed")
 		return consentCall{}, false
 	case !available:
-		apiError(w, http.StatusForbidden, httpsec.CodeForbidden, "the module is not on for your account")
+		apiError(w, http.StatusForbidden, httpsec.CodeForbidden, "the "+s.noun+" is not on for your account")
 		return consentCall{}, false
 	}
 	return consentCall{viewer: v, txn: t, info: info}, true

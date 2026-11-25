@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -40,6 +41,7 @@ func TestOpenSettings(t *testing.T) {
 	assert.Equal(t, "wal", scalar[string](t, s, `PRAGMA journal_mode`))
 	assert.Equal(t, 1, scalar[int](t, s, `PRAGMA foreign_keys`))
 	assert.Equal(t, 10000, scalar[int](t, s, `PRAGMA busy_timeout`))
+	assert.Equal(t, 2, scalar[int](t, s, `PRAGMA synchronous`), "2 is FULL")
 
 	info, err := os.Stat(path)
 	require.NoError(t, err)
@@ -93,9 +95,9 @@ func TestMigrations(t *testing.T) {
 	// A fresh file gets the gatekeeper's schema and the application's first step.
 	s, err := sqlitestore.Open(ctx, sqlitestore.Options{Path: path, Migrations: []sqlitestore.Migration{app1}, Logger: log})
 	require.NoError(t, err)
-	assert.Equal(t, []int{1}, versions(s, "gatekeeper"))
+	assert.Equal(t, []int{1, 2}, versions(s, "gatekeeper"))
 	assert.Equal(t, []int{1}, versions(s, "app"))
-	assert.Len(t, rec.Records(), 2, "one log line per applied step")
+	assert.Len(t, rec.Records(), 3, "one log line per applied step")
 	require.NoError(t, s.Accounts().Create(ctx, core.Account{ID: "acc_1", Name: "A", CreatedAt: time.Now()}))
 	_, err = s.Conn(ctx).ExecContext(ctx, `INSERT INTO notes (body) VALUES ('kept')`)
 	require.NoError(t, err)
@@ -468,4 +470,240 @@ func TestConformanceOnAFileWithApplicationTables(t *testing.T) {
 	storetest.Run(t, func(t *testing.T, cascades ...store.Cascade) store.Store {
 		return notesStore(t, cascades...)
 	})
+}
+
+func modeOf(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	return info.Mode().Perm()
+}
+
+func modeWarnings(rec *testlog.Recorder) []testlog.Record {
+	var out []testlog.Record
+	for _, r := range rec.Records() {
+		if r.Level == slog.LevelWarn && r.Message == modeMessage {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+const modeMessage = "sqlitestore: file mode corrected"
+
+// A database that is already there with loose modes is tightened, and Open says so; a file that is right is left alone
+// and silent (GK-8).
+func TestOpenTightensModes(t *testing.T) {
+	ctx := t.Context()
+	dir := filepath.Join(t.TempDir(), "data")
+	path := filepath.Join(dir, "gatekeeper.db")
+	require.NoError(t, os.Mkdir(dir, 0o755))           //nolint:gosec // a loose directory is the point of the test
+	require.NoError(t, os.WriteFile(path, nil, 0o644)) //nolint:gosec // so is a loose file
+	require.NoError(t, os.Chmod(dir, 0o755))           //nolint:gosec // the umask may have narrowed it
+
+	log, rec := testlog.New()
+	s, err := sqlitestore.Open(ctx, sqlitestore.Options{Path: path, Logger: log})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	assert.Equal(t, os.FileMode(0o700), modeOf(t, dir))
+	assert.Equal(t, os.FileMode(0o600), modeOf(t, path))
+	warned := modeWarnings(rec)
+	require.Len(t, warned, 2, "the directory and the file")
+	assert.Equal(t, dir, warned[0].Attrs["path"])
+	assert.Equal(t, "-rwxr-xr-x", warned[0].Attrs["was"])
+	assert.Equal(t, path, warned[1].Attrs["path"])
+
+	// The -wal and -shm of a database that is open are tightened by the next Open on the file, and those it creates
+	// itself are 0600 from the start.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		assert.Equal(t, os.FileMode(0o600), modeOf(t, path+suffix), suffix)
+		require.NoError(t, os.Chmod(path+suffix, 0o666)) //nolint:gosec // loosened on purpose
+	}
+	log2, rec2 := testlog.New()
+	second, err := sqlitestore.Open(ctx, sqlitestore.Options{Path: path, Logger: log2})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = second.Close() })
+	for _, suffix := range []string{"-wal", "-shm"} {
+		assert.Equal(t, os.FileMode(0o600), modeOf(t, path+suffix), suffix)
+	}
+	assert.Len(t, modeWarnings(rec2), 2, "the -wal and the -shm")
+
+	// Nothing to correct, nothing said.
+	log3, rec3 := testlog.New()
+	third, err := sqlitestore.Open(ctx, sqlitestore.Options{Path: path, Logger: log3})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = third.Close() })
+	assert.Empty(t, modeWarnings(rec3))
+}
+
+// A shared directory with another mode (a home directory, /tmp, a volume root) is never chmodded: Open refuses it and
+// says why (review R-8). A directory Open creates inside one is the database's own; a 0700 one is used as it is.
+func TestOpenLeavesASharedDirectoryAlone(t *testing.T) {
+	ctx := t.Context()
+	shared := filepath.Join(t.TempDir(), "shared")
+	require.NoError(t, os.Mkdir(shared, 0o755)) //nolint:gosec // a shared directory is the point of the test
+	require.NoError(t, os.Chmod(shared, 0o755)) //nolint:gosec // the umask may have narrowed it
+	require.NoError(t, os.WriteFile(filepath.Join(shared, "notes.txt"), []byte("x"), 0o600))
+
+	log, rec := testlog.New()
+	_, err := sqlitestore.Open(ctx, sqlitestore.Options{Path: filepath.Join(shared, "gatekeeper.db"), Logger: log})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "the database's directory "+shared+" has mode -rwxr-xr-x, not 0700, and it holds "+
+		"other files (notes.txt), so Open will not change it: use a directory of its own for the database")
+	assert.Equal(t, os.FileMode(0o755), modeOf(t, shared))
+	assert.NoFileExists(t, filepath.Join(shared, "gatekeeper.db"), "nothing is created there")
+	assert.Empty(t, modeWarnings(rec))
+
+	// A directory of its own inside the shared one: created 0700, the shared one untouched.
+	path := filepath.Join(shared, "app", "data", "gatekeeper.db")
+	open(t, sqlitestore.Options{Path: path, Logger: log})
+	assert.Equal(t, os.FileMode(0o700), modeOf(t, filepath.Dir(path)))
+	assert.Equal(t, os.FileMode(0o755), modeOf(t, shared))
+	assert.Empty(t, modeWarnings(rec))
+
+	// A 0700 directory that also holds the application's own files is fine as it is.
+	own := filepath.Join(t.TempDir(), "own")
+	require.NoError(t, os.Mkdir(own, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(own, "app.yaml"), []byte("x"), 0o600))
+	open(t, sqlitestore.Options{Path: filepath.Join(own, "gatekeeper.db"), Logger: log})
+	assert.Equal(t, os.FileMode(0o700), modeOf(t, own))
+	assert.Empty(t, modeWarnings(rec))
+}
+
+// The database's own loose directory, empty or holding only its files (a leftover -wal, -shm or -journal included),
+// is tightened with a warning.
+func TestOpenTightensItsOwnDirectory(t *testing.T) {
+	for name, files := range map[string][]string{
+		"empty":         nil,
+		"its own files": {"gatekeeper.db", "gatekeeper.db-wal", "gatekeeper.db-shm", "gatekeeper.db-journal"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "data")
+			require.NoError(t, os.Mkdir(dir, 0o755)) //nolint:gosec // a loose directory is the point of the test
+			require.NoError(t, os.Chmod(dir, 0o755)) //nolint:gosec // the umask may have narrowed it
+			for _, f := range files {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, f), nil, 0o600))
+			}
+			log, rec := testlog.New()
+			open(t, sqlitestore.Options{Path: filepath.Join(dir, "gatekeeper.db"), Logger: log})
+			assert.Equal(t, os.FileMode(0o700), modeOf(t, dir))
+			warned := modeWarnings(rec)
+			require.NotEmpty(t, warned)
+			assert.Equal(t, dir, warned[0].Attrs["path"])
+		})
+	}
+}
+
+// A new database is created with the right modes and nothing to warn about.
+func TestOpenCreatesWithModes(t *testing.T) {
+	log, rec := testlog.New()
+	path := dbPath(t)
+	open(t, sqlitestore.Options{Path: path, Logger: log})
+	assert.Equal(t, os.FileMode(0o700), modeOf(t, filepath.Dir(path)))
+	assert.Equal(t, os.FileMode(0o600), modeOf(t, path))
+	assert.Empty(t, modeWarnings(rec))
+}
+
+// The audit ids keep rising across a restart, even when the clock is behind the ids already stored (GK-9).
+func TestAuditIDsContinueAfterReopen(t *testing.T) {
+	ctx := t.Context()
+	path := dbPath(t)
+	ahead := time.Date(2036, 1, 1, 0, 0, 0, 0, time.UTC)
+	first, err := sqlitestore.Open(ctx, sqlitestore.Options{Path: path, Clock: func() time.Time { return ahead }})
+	require.NoError(t, err)
+	for i := range 3 {
+		require.NoError(t, first.Audit().Append(ctx, core.AuditEntry{At: ahead, Action: fmt.Sprint("before", i)}))
+	}
+	require.NoError(t, first.Close())
+
+	behind := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	second := open(t, sqlitestore.Options{Path: path, Clock: func() time.Time { return behind }})
+	for i := range 3 {
+		require.NoError(t, second.Audit().Append(ctx, core.AuditEntry{At: behind, Action: fmt.Sprint("after", i)}))
+	}
+	list, err := second.Audit().ListSystem(ctx, "", 10)
+	require.NoError(t, err)
+	var actions []string
+	for _, e := range list {
+		actions = append(actions, e.Action)
+	}
+	assert.Equal(t, []string{"after2", "after1", "after0", "before2", "before1", "before0"}, actions,
+		"newest first: what was appended after the restart is newer")
+}
+
+// An empty audit table, or one with an id that is not ours, does not stop Open.
+func TestAuditSeedIgnoresForeignIDs(t *testing.T) {
+	ctx := t.Context()
+	path := dbPath(t)
+	s := open(t, sqlitestore.Options{Path: path})
+	_, err := s.Conn(ctx).ExecContext(ctx, `INSERT INTO gk_audit (id, at, action) VALUES ('zzz', 0, 'foreign')`)
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+	again := open(t, sqlitestore.Options{Path: path})
+	require.NoError(t, again.Audit().Append(ctx, core.AuditEntry{At: time.Now(), Action: "mine"}))
+}
+
+// A database written by the first schema is upgraded in place: the rows stay, read as people and invites without a
+// term or permissions, and the new columns work.
+func TestMigrationToTheAccessColumns(t *testing.T) {
+	ctx := t.Context()
+	path := dbPath(t)
+	s := open(t, sqlitestore.Options{Path: path})
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	require.NoError(t, s.Accounts().Create(ctx, core.Account{ID: "acc_1", Name: "Home", CreatedAt: now}))
+	require.NoError(t, s.People().Create(ctx, core.Person{ID: "per_1", AccountID: "acc_1", Name: "Alice", Role: core.RoleOwner, CreatedAt: now}))
+	require.NoError(t, s.Invites().Create(ctx, core.Invite{ID: "inv_1", TokenHash: []byte("tok"), Kind: core.InviteMember,
+		AccountID: "acc_1", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}))
+	// Put the file back to what the first build left: no access columns, no audit index, version 2 not recorded.
+	for _, stmt := range []string{
+		`DROP INDEX gk_audit_at`,
+		`ALTER TABLE gk_people DROP COLUMN access_until`, `ALTER TABLE gk_people DROP COLUMN permissions`,
+		`ALTER TABLE gk_invites DROP COLUMN access_until`, `ALTER TABLE gk_invites DROP COLUMN permissions`,
+		`DELETE FROM gk_schema_migrations WHERE component = 'gatekeeper' AND version = 2`,
+	} {
+		_, err := s.Conn(ctx).ExecContext(ctx, stmt)
+		require.NoError(t, err, stmt)
+	}
+	require.NoError(t, s.Close())
+
+	log, rec := testlog.New()
+	up, err := sqlitestore.Open(ctx, sqlitestore.Options{Path: path, Logger: log})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = up.Close() })
+	require.Len(t, rec.Records(), 1, "only the second step runs")
+	assert.Equal(t, "2", rec.Records()[0].Attrs["version"])
+
+	p, err := up.People().Get(ctx, "per_1")
+	require.NoError(t, err)
+	assert.Equal(t, core.Person{ID: "per_1", AccountID: "acc_1", Name: "Alice", Role: core.RoleOwner, CreatedAt: now}, p)
+	inv, err := up.Invites().Peek(ctx, []byte("tok"), now)
+	require.NoError(t, err)
+	assert.Nil(t, inv.AccessUntil)
+	assert.Nil(t, inv.Permissions)
+	until := now.Add(time.Hour)
+	require.NoError(t, up.People().SetAccess(ctx, "per_1", &until, []string{core.PermissionAll}))
+	p, err = up.People().Get(ctx, "per_1")
+	require.NoError(t, err)
+	assert.Equal(t, []string{core.PermissionAll}, p.Permissions)
+}
+
+// Purge runs in one transaction with the caller's context and rolls back with it.
+func TestPurgeJoinsTheTransaction(t *testing.T) {
+	ctx := t.Context()
+	s := open(t, sqlitestore.Options{})
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	require.NoError(t, s.OAuth().PutToken(ctx, core.Token{Hash: []byte("t"), GrantID: "g", Kind: core.TokenAccess, CreatedAt: now,
+		ExpiresAt: now.Add(-time.Hour)}))
+	err := s.Tx(ctx, func(ctx context.Context) error {
+		st, err := s.Purge(ctx, now)
+		require.NoError(t, err)
+		assert.Equal(t, 1, st.Tokens)
+		return errBoom
+	})
+	require.ErrorIs(t, err, errBoom)
+	_, err = s.OAuth().GetToken(ctx, []byte("t"))
+	require.NoError(t, err, "the rollback brought the token back")
+	st, err := s.Purge(ctx, now)
+	require.NoError(t, err)
+	assert.Equal(t, store.PurgeStats{Tokens: 1}, st)
 }

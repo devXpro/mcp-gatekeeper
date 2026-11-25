@@ -85,12 +85,17 @@ type personDoc struct {
 	Superadmin bool       `bson:"superadmin"`
 	CreatedAt  time.Time  `bson:"created_at"`
 	DisabledAt *time.Time `bson:"disabled_at,omitempty"`
+	// The access term and permissions are absent from a person who has neither, so such a document is the one Family
+	// Hub's own store writes.
+	AccessUntil *time.Time `bson:"access_until,omitempty"`
+	Permissions []string   `bson:"permissions,omitempty"`
 }
 
 func (d personDoc) toCore() core.Person {
 	return core.Person{
 		ID: core.PersonID(d.ID), AccountID: core.AccountID(d.AccountID), Name: d.Name, Role: core.Role(d.Role),
 		Superadmin: d.Superadmin, CreatedAt: utc(d.CreatedAt), DisabledAt: optTime(d.DisabledAt),
+		AccessUntil: optTime(d.AccessUntil), Permissions: d.Permissions,
 	}
 }
 
@@ -100,6 +105,7 @@ func (p personStore) Create(ctx context.Context, person core.Person) error {
 	return p.s.c(colPeople).insert(ctx, personDoc{
 		ID: string(person.ID), AccountID: string(person.AccountID), Name: person.Name, Role: string(person.Role),
 		Superadmin: person.Superadmin, CreatedAt: person.CreatedAt, DisabledAt: optTime(person.DisabledAt),
+		AccessUntil: optTime(person.AccessUntil), Permissions: person.Permissions,
 	})
 }
 
@@ -137,6 +143,30 @@ func (p personStore) Rename(ctx context.Context, id core.PersonID, name string) 
 
 func (p personStore) Disable(ctx context.Context, id core.PersonID, at time.Time) error {
 	return p.s.c(colPeople).update(ctx, idIs(string(id)), set(kv("disabled_at", at)))
+}
+
+// SetAccess replaces the person's term and permissions. A field that is cleared (nil, or no permissions) is removed
+// from the document, which then reads like one that never had it.
+func (p personStore) SetAccess(ctx context.Context, id core.PersonID, until *time.Time, perms []string) error {
+	var sets, unsets bson.D
+	if until != nil {
+		sets = append(sets, bson.E{Key: "access_until", Value: until.UTC()})
+	} else {
+		unsets = append(unsets, bson.E{Key: "access_until", Value: ""})
+	}
+	if len(perms) > 0 {
+		sets = append(sets, bson.E{Key: "permissions", Value: perms})
+	} else {
+		unsets = append(unsets, bson.E{Key: "permissions", Value: ""})
+	}
+	var update bson.D
+	if len(sets) > 0 {
+		update = append(update, bson.E{Key: "$set", Value: sets})
+	}
+	if len(unsets) > 0 {
+		update = append(update, bson.E{Key: "$unset", Value: unsets})
+	}
+	return p.s.c(colPeople).update(ctx, idIs(string(id)), update)
 }
 
 // Delete removes the person with their passkeys, sessions and grants (and the tokens and codes of those), in one

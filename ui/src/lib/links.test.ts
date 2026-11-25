@@ -9,7 +9,7 @@ describe('safeNext', () => {
 
   it('refuses anything that could leave the hub, and the login page itself', () => {
     for (const v of [null, '', 'https://evil.example', '//evil.example', '/\\evil.example', 'javascript:alert(1)', '/login', '/login?next=/x']) {
-      expect(safeNext(v)).toBe('/connect')
+      expect(safeNext(v)).toBe('/')
     }
   })
 })

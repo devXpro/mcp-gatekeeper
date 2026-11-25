@@ -12,10 +12,30 @@ export interface Brand {
   icon: LucideIcon
 }
 
+/** The people options of the Go side the screens must follow (people.Options); Family Hub's behaviour by default. */
+export interface Features {
+  /** people.Options.SingleAccount: one account only, so the superadmin's families section is hidden */
+  singleAccount: boolean
+  /** people.Options.CoOwners: the superadmin may invite a co-owner into the account */
+  coOwners: boolean
+  /** the owner's «Удалить всё» (the section on /account and the page /account/delete); on by default */
+  accountDelete: boolean
+}
+
 let current: Brand | undefined
+let currentFeatures: Features = { singleAccount: false, coOwners: false, accountDelete: true }
 
 export function setBrand(b: Brand) {
   current = b
+}
+
+export function setFeatures(f: Partial<Features>) {
+  currentFeatures = { singleAccount: !!f.singleAccount, coOwners: !!f.coOwners, accountDelete: f.accountDelete !== false }
+}
+
+/** features returns the people options configure() was given. */
+export function features(): Features {
+  return currentFeatures
 }
 
 /** brand returns the configured brand; configure() must have run. */

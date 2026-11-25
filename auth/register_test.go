@@ -172,7 +172,9 @@ func TestTokenInfo(t *testing.T) {
 	info := func(url string) *httptest.ResponseRecorder {
 		return b.do(http.MethodPost, "/api/auth/token", map[string]string{"token": tokenOf(t, url, testOrigin+"/join#t=")})
 	}
-	assert.JSONEq(t, `{"kind":"owner","name":"Ира","account_name":"Семья"}`, info(owner.URL).Body.String())
+	// The superadmin's own account has its owner: this owner invite makes a co-owner (the first owner of a new
+	// account, Family Hub's case, has no co_owner: TestCoOwnerInvite).
+	assert.JSONEq(t, `{"kind":"owner","name":"Ира","account_name":"Семья","co_owner":true}`, info(owner.URL).Body.String())
 	assert.JSONEq(t, `{"kind":"member","name":"Белла","account_name":"Семья"}`, info(member.URL).Body.String())
 
 	// Withdrawn, expired, unknown and malformed tokens all answer 404 (used ones too: TestRegisterFinishRefusals).

@@ -25,6 +25,14 @@
 // other platforms refuse every peer): only the application's own user and root get in, so a mode slip alone does not
 // open it to others. Whoever gets in is the server operator: commands need no passkey, no session and no step-up.
 //
+// That makes the socket exactly as strong as the uid boundary. In a container, or under a dedicated service user
+// (Linux), the uid is the server alone. On a desktop where the application runs as the logged-in user, every program
+// of that user gets in, and such a program can as well replace the application's binary or read its data dir, so no
+// check of the socket alone would close that. What the server adds is a trace: each command's Invocation.Peer holds
+// the peer's pid and executable path and who started it (Peer.Chain: up to three ancestors, since the peer is
+// usually the application's own CLI), the log line of every command names them, and destructive commands (package
+// auth's reset-access and setup-link) put them into their audit entries.
+//
 // # The wire
 //
 // HTTP/1.1 over the socket:
@@ -96,6 +104,22 @@ type Invocation struct {
 	Args  []string  // the words after the command name; never nil
 	Stdin []byte    // the CLI's standard input when Command.Stdin is set, else nil
 	Out   io.Writer // the operator's terminal; nothing written here is logged
+	Peer  Peer      // the process that connected; the zero Peer when unknown (Handler without the socket)
+}
+
+// Peer is the process on the other end of the socket, as the kernel named it when it connected (SO_PEERCRED on
+// Linux; LOCAL_PEERCRED and LOCAL_PEERPID on macOS). Only UID decides who gets in; PID, Exe and Chain are for the
+// audit and the log (who ran a destructive command), never for access: the process may have exited since and its pid
+// been reused, and a process of the same user can be any program.
+type Peer struct {
+	UID int    // the peer's user id
+	PID int    // the peer's process id; 0 when unknown
+	Exe string // the absolute path of the peer's executable; "" when unknown
+	// Chain names who started the peer: up to three of its ancestors, nearest first, each "<exe> (pid N)" joined by
+	// " < ", e.g. "/bin/zsh (pid 41) < login (pid 40) < /…/Terminal (pid 12)". The peer is usually the application's
+	// own CLI, so this is the part that tells who asked. An ancestor whose executable the kernel does not show (one of
+	// another user) is named by its short command name; one that cannot be read ends the chain. "" when unknown.
+	Chain string
 }
 
 // CommandInfo describes a command to the CLI.
@@ -241,12 +265,14 @@ func (s *Server) Start(ctx context.Context) error {
 		Handler:           s.handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return base },
+		ConnContext:       withPeer,
 		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelError),
 	}
 	srv, done := s.srv, s.done
 	go func() {
 		defer close(done)
-		if err := srv.Serve(&peerListener{Listener: ln, log: s.log, uidOf: peerUID}); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		pl := &peerListener{Listener: ln, log: s.log, uidOf: peerUID, procOf: peerProcess, chainOf: peerChain}
+		if err := srv.Serve(pl); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.log.Error("adminsock: serve", slog.Any("error", err))
 		}
 	}()
@@ -300,11 +326,16 @@ func clearStale(ctx context.Context, path string) error {
 	return nil
 }
 
-// peerListener accepts only connections from processes of the application's own user or root.
+// peerListener accepts only connections from processes of the application's own user or root, and remembers the
+// peer process of each (peerConn).
 type peerListener struct {
 	net.Listener
-	log   *slog.Logger
-	uidOf func(net.Conn) (int, error) // peerUID; tests swap it
+	log    *slog.Logger
+	uidOf  func(net.Conn) (int, error)  // peerUID; tests swap it
+	procOf func(net.Conn) (int, string) // peerProcess: the pid and executable, best effort; nil leaves them unknown
+	// chainOf is peerChain: the peer's ancestors, read at accept time, while the peer is surely alive; nil leaves
+	// them unknown.
+	chainOf func(pid int) string
 }
 
 func (l *peerListener) Accept() (net.Conn, error) {
@@ -315,7 +346,14 @@ func (l *peerListener) Accept() (net.Conn, error) {
 		}
 		uid, err := l.uidOf(c)
 		if err == nil && allowedUID(uid) {
-			return c, nil
+			p := Peer{UID: uid}
+			if l.procOf != nil {
+				p.PID, p.Exe = l.procOf(c)
+			}
+			if l.chainOf != nil && p.PID > 0 {
+				p.Chain = l.chainOf(p.PID)
+			}
+			return &peerConn{Conn: c, peer: p}, nil
 		}
 		attrs := []any{slog.Int("uid", uid)}
 		if err != nil {
@@ -329,6 +367,36 @@ func (l *peerListener) Accept() (net.Conn, error) {
 // allowedUID reports whether a peer of this uid may use the socket: the application's own user, or root, who can
 // read its data dir anyway.
 func allowedUID(uid int) bool { return uid >= 0 && (uid == 0 || uid == os.Getuid()) }
+
+// peerConn is an accepted connection with its peer.
+type peerConn struct {
+	net.Conn
+	peer Peer
+}
+
+// CloseWrite keeps the half-close net/http uses after an error answer, which embedding alone would hide.
+func (c *peerConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+type peerKey struct{}
+
+// withPeer is the server's ConnContext: the requests of a connection carry its peer.
+func withPeer(ctx context.Context, c net.Conn) context.Context {
+	if pc, ok := c.(*peerConn); ok {
+		return context.WithValue(ctx, peerKey{}, pc.peer)
+	}
+	return ctx
+}
+
+// peerOf returns the peer a request's connection came from; the zero Peer without one.
+func peerOf(ctx context.Context) Peer {
+	p, _ := ctx.Value(peerKey{}).(Peer)
+	return p
+}
 
 // The wire.
 
@@ -410,7 +478,7 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := &frameWriter{w: w, rc: http.NewResponseController(w)}
-	inv := Invocation{Args: req.Args, Out: out}
+	inv := Invocation{Args: req.Args, Out: out, Peer: peerOf(r.Context())}
 	if inv.Args == nil {
 		inv.Args = []string{}
 	}
@@ -436,8 +504,14 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		code = result.Error
 	}
-	s.log.Info("adminsock: command", slog.String("command", cmd.Name), slog.String("result", code),
-		slog.Duration("took", time.Since(start)))
+	attrs := []any{slog.String("command", cmd.Name), slog.String("result", code), slog.Duration("took", time.Since(start))}
+	if inv.Peer.PID > 0 {
+		attrs = append(attrs, slog.Int("peer_pid", inv.Peer.PID), slog.String("peer_exe", inv.Peer.Exe))
+		if inv.Peer.Chain != "" {
+			attrs = append(attrs, slog.String("peer_chain", inv.Peer.Chain))
+		}
+	}
+	s.log.Info("adminsock: command", attrs...)
 }
 
 // call runs a command, turning a panic into an error so the stream still ends with a result frame. The panic's

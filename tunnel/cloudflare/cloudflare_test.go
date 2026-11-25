@@ -3,6 +3,7 @@ package cloudflare
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -150,7 +151,7 @@ func TestConnect(t *testing.T) {
 
 	cfg, err := os.ReadFile(filepath.Join(c.dir, ConfigFile))
 	require.NoError(t, err)
-	assert.Equal(t, "tunnel: "+tunnelID+"\ncredentials-file: "+creds+"\nno-autoupdate: true\ningress:\n"+
+	assert.Equal(t, "tunnel: "+tunnelID+"\ncredentials-file: '"+creds+"'\nno-autoupdate: true\ningress:\n"+
 		"  - hostname: hub.example.com\n    service: http://fh-hub:8080\n  - service: http_status:404\n", string(cfg))
 	if runtime.GOOS != "windows" {
 		assert.Equal(t, os.FileMode(0o700), mode(t, c.dir))
@@ -170,6 +171,40 @@ func TestConnect(t *testing.T) {
 		f.commands())
 	assert.Contains(t, out.String(), "reusing tunnel family-hub-hub-example-com")
 	noLeftoverHome(t, c)
+}
+
+// A tunnel directory whose name holds YAML syntax (": ", " #", a quote) still gives a config.yml that reads back the
+// exact credentials path (review R-14).
+func TestConfigQuotesTheCredentialsPath(t *testing.T) {
+	f := &fakeCloudflared{}
+	dir := filepath.Join(t.TempDir(), "my data: it's #1", "tunnel")
+	c, err := New(Options{Runner: f, Dir: dir, Service: "http://127.0.0.1:8080", TempDir: t.TempDir()})
+	require.NoError(t, err)
+	_, err = c.Connect(t.Context(), ConnectOptions{Hostname: "home.example.com"}, &bytes.Buffer{})
+	require.NoError(t, err)
+
+	cfg, err := os.ReadFile(filepath.Join(dir, ConfigFile)) //nolint:gosec // G304: the test's own directory
+	require.NoError(t, err)
+	creds := filepath.Join(dir, CredentialsFile)
+	assert.Contains(t, string(cfg), "\ncredentials-file: '"+strings.ReplaceAll(creds, "'", "''")+"'\n")
+	want, err := json.Marshal(map[string]any{
+		"tunnel": tunnelID, "credentials-file": creds, "no-autoupdate": true,
+		"ingress": []map[string]string{{"hostname": "home.example.com", "service": "http://127.0.0.1:8080"},
+			{"service": "http_status:404"}},
+	})
+	require.NoError(t, err)
+	assert.YAMLEq(t, string(want), string(cfg), "a YAML parser reads the exact values back")
+}
+
+func TestYAMLQuote(t *testing.T) {
+	for in, want := range map[string]string{ //nolint:gosec // G101: paths, no credentials
+		"/home/user/data/credentials.json": "'/home/user/data/credentials.json'",
+		"/home/user/a: b #c/x.json":        "'/home/user/a: b #c/x.json'",
+		"/home/user/it's/x.json":           "'/home/user/it''s/x.json'",
+		"":                                 "''",
+	} {
+		assert.Equal(t, want, yamlQuote(in), in)
+	}
 }
 
 func TestConnectFailures(t *testing.T) {

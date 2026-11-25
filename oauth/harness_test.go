@@ -75,8 +75,8 @@ type harness struct {
 
 // newHarness serves hubURL with Family Hub's paths (core.PerResource at /mcp/), the default switches and these
 // resources: notes and photos can be connected and are on for the Millers; old is on for them but cannot be
-// connected (a stopped module); secret can be connected and is on only for the Friends. Every session has a fresh
-// step-up, as right after a sign-in, until a test makes it stale.
+// connected (a stopped module); secret can be connected and is on only for the Friends. Alice, Bob and Carol are in
+// the store without a term. Every session has a fresh step-up, as right after a sign-in, until a test makes it stale.
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	return newHarnessWith(t, nil)
@@ -97,10 +97,11 @@ func newHarnessWith(t *testing.T, edit func(o *Options)) *harness {
 	}, true, millers.ID)
 	h.catalog.add(core.ResourceInfo{ID: "old", Name: "Old"}, false, millers.ID)
 	h.catalog.add(core.ResourceInfo{ID: "secret", Name: "Secret"}, true, friends.ID)
-	h.sessions = &fakeSessions{
-		viewers: map[string]core.Viewer{"alice": alice, "bob": bob, "carol": carol}, clock: h.clock,
-		stale: map[string]bool{},
+	viewers := map[string]core.Viewer{"alice": alice, "bob": bob, "carol": carol}
+	for _, v := range viewers {
+		require.NoError(t, h.store.People().Create(t.Context(), v.Person))
 	}
+	h.sessions = &fakeSessions{viewers: viewers, clock: h.clock, store: h.store, stale: map[string]bool{}}
 	o := Options{
 		Site:  core.Site{PublicURL: hubURL, RPID: "hub.example.com", ClientIP: core.ClientIPRemote},
 		Brand: testBrand, Store: h.store, Sessions: h.sessions, Catalog: h.catalog,

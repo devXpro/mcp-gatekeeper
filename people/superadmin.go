@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 
 	"github.com/devXpro/mcp-gatekeeper/core"
 	"github.com/devXpro/mcp-gatekeeper/httpsec"
@@ -16,13 +17,18 @@ type adminAccountJSON struct {
 	CreatedAt string         `json:"created_at"`
 }
 
-// listAccounts is GET /api/admin/accounts: every account with counts, never its members or data.
+// listAccounts is GET /api/admin/accounts: every account with counts, never its members or data. With
+// Options.SingleAccount, the superadmin's own account only.
 func (s *Service) listAccounts(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	list, err := s.Summaries(ctx)
 	if err != nil {
 		s.fail(w, r, err)
 		return
+	}
+	if s.o.SingleAccount {
+		mine := viewer(r).Account.ID
+		list = slices.DeleteFunc(list, func(sum Summary) bool { return sum.Account.ID != mine })
 	}
 	rows := make([]json.RawMessage, 0, len(list))
 	for _, sum := range list {

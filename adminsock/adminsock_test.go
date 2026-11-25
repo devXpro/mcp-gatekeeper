@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -253,6 +254,59 @@ func TestOutputStreams(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "authorized\n", string(rest))
 	require.NoError(t, <-done)
+}
+
+// A command sees the process that connected (review GK-5): its user, pid and executable, the same the log names.
+// Through Handler, without the socket, the peer is unknown.
+func TestCommandsSeeTheirPeer(t *testing.T) {
+	peers := make(chan Peer, 2)
+	whoami := Command{Name: "whoami", Summary: "the peer", Run: func(_ context.Context, inv Invocation) error {
+		peers <- inv.Peer
+		return nil
+	}}
+	_, path, logs := startServer(t, []Command{whoami})
+	require.NoError(t, NewClient(path).Run(context.Background(), "whoami", nil, nil, io.Discard))
+	p := <-peers
+	assert.Equal(t, os.Getuid(), p.UID)
+	assert.Equal(t, os.Getpid(), p.PID, "this test process is the client")
+	exe, err := os.Executable()
+	require.NoError(t, err)
+	assert.Equal(t, realPath(t, exe), realPath(t, p.Exe))
+	assert.Equal(t, peerChain(os.Getpid()), p.Chain, "who started the peer (review R-5)")
+	assert.NotEmpty(t, p.Chain)
+	found := false
+	for _, rec := range logs.Records() {
+		found = found || rec.Message == "adminsock: command" && rec.Attrs["peer_pid"] == strconv.Itoa(os.Getpid()) &&
+			rec.Attrs["peer_exe"] == p.Exe && rec.Attrs["peer_chain"] == p.Chain
+	}
+	assert.True(t, found, "the log line names the peer")
+
+	s := newServer(t, "/tmp/unused.sock", nil, []Command{whoami})
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/run", strings.NewReader(`{"command":"whoami"}`)))
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, Peer{}, <-peers)
+}
+
+func realPath(t *testing.T, p string) string {
+	t.Helper()
+	require.NotEmpty(t, p)
+	r, err := filepath.EvalSymlinks(p)
+	require.NoError(t, err)
+	return r
+}
+
+// A peer connection keeps the unix socket's half-close, and a connection without one has nothing to half-close.
+func TestPeerConnCloseWrite(t *testing.T) {
+	server, client := unixPair(t)
+	defer func() { _ = client.Close() }()
+	require.NoError(t, (&peerConn{Conn: server}).CloseWrite())
+	_, err := client.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF, "the peer sees the half-close")
+	a, b := net.Pipe()
+	defer func() { _ = a.Close(); _ = b.Close() }()
+	require.NoError(t, (&peerConn{Conn: a}).CloseWrite())
+	assert.Equal(t, context.Background(), withPeer(context.Background(), a), "a plain connection carries no peer")
 }
 
 // Stop cancels a command that still runs, and removes the socket file.

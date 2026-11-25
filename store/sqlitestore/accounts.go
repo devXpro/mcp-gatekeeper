@@ -93,7 +93,7 @@ func scanString(r scanner) (string, error) {
 	return v, err
 }
 
-const personCols = `id, account_id, name, role, superadmin, created_at, disabled_at`
+const personCols = `id, account_id, name, role, superadmin, created_at, disabled_at, access_until, permissions`
 
 func scanPerson(r scanner) (core.Person, error) {
 	var (
@@ -101,22 +101,32 @@ func scanPerson(r scanner) (core.Person, error) {
 		id, account, role string
 		superadmin        int
 		created           int64
-		disabled          sql.NullInt64
+		disabled, until   sql.NullInt64
+		perms             sql.NullString
 	)
-	if err := r.Scan(&id, &account, &p.Name, &role, &superadmin, &created, &disabled); err != nil {
+	if err := r.Scan(&id, &account, &p.Name, &role, &superadmin, &created, &disabled, &until, &perms); err != nil {
 		return core.Person{}, err
 	}
 	p.ID, p.AccountID, p.Role = core.PersonID(id), core.AccountID(account), core.Role(role)
 	p.Superadmin, p.CreatedAt, p.DisabledAt = superadmin != 0, fromMS(created), optTime(disabled)
+	p.AccessUntil = optTime(until)
+	var err error
+	if p.Permissions, err = decodePermissions(perms); err != nil {
+		return core.Person{}, fmt.Errorf("permissions of person %q: %w", id, err)
+	}
 	return p, nil
 }
 
 type people struct{ s *Store }
 
 func (p people) Create(ctx context.Context, person core.Person) error {
-	_, err := p.s.exec(ctx, "create person", `INSERT INTO gk_people (`+personCols+`) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+	perms, err := encodePermissions(person.Permissions)
+	if err != nil {
+		return wrap("create person", err)
+	}
+	_, err = p.s.exec(ctx, "create person", `INSERT INTO gk_people (`+personCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		string(person.ID), string(person.AccountID), person.Name, string(person.Role), boolInt(person.Superadmin),
-		ms(person.CreatedAt), optMS(person.DisabledAt))
+		ms(person.CreatedAt), optMS(person.DisabledAt), optMS(person.AccessUntil), perms)
 	return err
 }
 
@@ -145,6 +155,16 @@ func (p people) Rename(ctx context.Context, id core.PersonID, name string) error
 
 func (p people) Disable(ctx context.Context, id core.PersonID, at time.Time) error {
 	return p.s.execOne(ctx, "disable person", `UPDATE gk_people SET disabled_at = ? WHERE id = ?`, ms(at), string(id))
+}
+
+// SetAccess replaces the person's term and permissions; nil (or no permissions) clears each.
+func (p people) SetAccess(ctx context.Context, id core.PersonID, until *time.Time, perms []string) error {
+	raw, err := encodePermissions(perms)
+	if err != nil {
+		return wrap("set access", err)
+	}
+	return p.s.execOne(ctx, "set access", `UPDATE gk_people SET access_until = ?, permissions = ? WHERE id = ?`,
+		optMS(until), raw, string(id))
 }
 
 // Delete removes the person with their passkeys, sessions, grants (and the tokens and codes of those), then runs the

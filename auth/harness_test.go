@@ -32,6 +32,9 @@ const (
 	product    = "Family Hub"
 )
 
+// testSite is a site with only what auth needs: the public URL and a client address mode (core.Site.Validate).
+var testSite = core.Site{PublicURL: testOrigin, ClientIP: core.ClientIPRemote}
+
 // testBrand is Family Hub's brand.
 var testBrand = core.Brand{Product: product, SessionCookie: cookieName, TxnCookie: "__Host-fh_txn", CSRFHeader: csrfHeader}
 
@@ -77,15 +80,20 @@ func (e *env) secret(s string) {
 	e.secrets = append(e.secrets, s)
 }
 
-func newEnv(t *testing.T) *env {
+// newEnv sets up Family Hub's site; each of change may adjust the options first.
+func newEnv(t *testing.T, change ...func(*Options)) *env {
 	t.Helper()
 	log, logs := testlog.New()
 	e := &env{t: t, st: newFakeStore(), clock: &clock{t: time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)}, logs: logs}
-	a, err := New(Options{
+	o := Options{
 		Site:  core.Site{PublicURL: testOrigin, RPID: testHost, ClientIP: core.ClientIPCloudflare},
 		Brand: testBrand, Store: e.st, Logger: log, Clock: e.clock.Now, AdminCLI: "hub admin",
 		ResetSteps: []ResetStep{legacyStep(e.st)},
-	})
+	}
+	for _, c := range change {
+		c(&o)
+	}
+	a, err := New(o)
 	require.NoError(t, err)
 	e.a = a
 	mux := http.NewServeMux()
@@ -105,13 +113,19 @@ func newEnv(t *testing.T) *env {
 // command runs one of auth's admin commands the way the socket does and returns its output.
 func (e *env) command(name string, args ...string) (string, error) {
 	e.t.Helper()
+	return e.commandFrom(adminsock.Peer{}, name, args...)
+}
+
+// commandFrom is command run by the socket peer p.
+func (e *env) commandFrom(p adminsock.Peer, name string, args ...string) (string, error) {
+	e.t.Helper()
 	for _, c := range e.a.AdminCommands() {
 		if c.Name == name {
 			var out bytes.Buffer
 			if args == nil {
 				args = []string{}
 			}
-			err := c.Run(context.Background(), adminsock.Invocation{Args: args, Out: &out})
+			err := c.Run(context.Background(), adminsock.Invocation{Args: args, Out: &out, Peer: p})
 			if i := strings.Index(out.String(), "#t="); i >= 0 {
 				e.secret(strings.Fields(out.String()[i+3:])[0])
 			}

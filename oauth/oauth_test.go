@@ -31,6 +31,8 @@ func TestNew(t *testing.T) {
 	assert.Equal(t, hubURL, srv.issuer)
 	assert.Equal(t, "__Host-fh_txn", srv.txnCookie)
 	assert.Equal(t, "family-hub", srv.realm)
+	assert.Equal(t, []string{"module", "hub"}, []string{srv.noun, srv.app}, "the brand's default words")
+	assert.Equal(t, pageMetadataInvalid, srv.badDoc)
 	assert.Equal(t, settings{stepUp: true, binding: true, connector: true}, srv.cfg, "the zero switches are the defaults")
 	assert.NotNil(t, srv.log, "a nil logger discards")
 	assert.False(t, srv.now().IsZero(), "a nil clock is the system's")
@@ -45,7 +47,7 @@ func TestNew(t *testing.T) {
 }
 
 func TestNewRefusesAPublicURLWithAPath(t *testing.T) {
-	_, err := New(Options{Site: core.Site{PublicURL: hubURL + "/hub"}})
+	_, err := New(Options{Site: core.Site{PublicURL: hubURL + "/hub", ClientIP: core.ClientIPRemote}})
 	require.Error(t, err)
 	assert.True(t, strings.Contains(err.Error(), "not an issuer"), err)
 }
@@ -67,6 +69,11 @@ func TestNewRefusesBadOptions(t *testing.T) {
 		{"a single resource whose id no URL can name", func(o *Options) {
 			o.Paths = core.SingleResource{At: "/mcp", ID: "Home"}
 		}, `"Home"`},
+		// core.Site.Validate (review GK-2): an empty or unknown mode would make every client behind a local connector
+		// one address.
+		{"no client address mode", func(o *Options) { o.Site.ClientIP = "" }, "client address mode"},
+		{"an unknown client address mode", func(o *Options) { o.Site.ClientIP = "cloudflare" }, `"cloudflare"`},
+		{"an RP ID of another host", func(o *Options) { o.Site.RPID = "other.example.com" }, "RP ID"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

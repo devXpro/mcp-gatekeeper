@@ -261,6 +261,7 @@ func (r fakePeople) Create(ctx context.Context, p core.Person) error {
 		return fmt.Errorf("fake person %q: %w", p.ID, core.ErrConflict)
 	}
 	p.CreatedAt, p.DisabledAt = ms(p.CreatedAt), msPtr(p.DisabledAt)
+	p.AccessUntil, p.Permissions = msPtr(p.AccessUntil), slices.Clone(p.Permissions)
 	r.s.d.people[p.ID] = p
 	return nil
 }
@@ -326,6 +327,17 @@ func (r fakePeople) Disable(ctx context.Context, id core.PersonID, at time.Time)
 		return notFound("person")
 	}
 	p.DisabledAt = msPtr(&at)
+	r.s.d.people[id] = p
+	return nil
+}
+
+func (r fakePeople) SetAccess(ctx context.Context, id core.PersonID, until *time.Time, perms []string) error {
+	defer r.s.lock(ctx)()
+	p, ok := r.s.d.people[id]
+	if !ok {
+		return notFound("person")
+	}
+	p.AccessUntil, p.Permissions = msPtr(until), append([]string(nil), perms...)
 	r.s.d.people[id] = p
 	return nil
 }
@@ -577,6 +589,7 @@ func (r fakeInvites) Create(ctx context.Context, inv core.Invite) error {
 	}
 	inv.TokenHash = bytes.Clone(inv.TokenHash)
 	inv.CreatedAt, inv.ExpiresAt, inv.UsedAt, inv.RevokedAt = ms(inv.CreatedAt), ms(inv.ExpiresAt), msPtr(inv.UsedAt), msPtr(inv.RevokedAt)
+	inv.AccessUntil, inv.Permissions = msPtr(inv.AccessUntil), slices.Clone(inv.Permissions)
 	r.s.d.invites[inv.ID] = inv
 	return nil
 }

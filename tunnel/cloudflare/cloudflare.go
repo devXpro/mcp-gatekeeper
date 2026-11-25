@@ -14,6 +14,10 @@
 // The cloudflared service of the application's stack runs the tunnel from that directory, mounted at the same path.
 // The cloudflared binary is reached through Runner, so tests (and applications that run it elsewhere) inject their
 // own.
+//
+// Connector.Start runs the same flow in the background for a web page, reporting Steps (the authorization link as soon
+// as cloudflared prints it). A desktop application that has no cloudflared service of its own runs the child with a
+// Supervisor, either on the tunnel directory (Named) or as a quick tunnel (Quick: no account, a random hostname).
 package cloudflare
 
 import (
@@ -55,6 +59,20 @@ var (
 
 // ErrHostname marks a hostname the command refuses.
 var ErrHostname = errors.New("bad hostname")
+
+// ErrDNSRecordExists marks a connect that stopped because the hostname already has a DNS record that cloudflared will
+// replace only with ConnectOptions.OverwriteDNS. Test it with errors.Is; the message is for people.
+var ErrDNSRecordExists = errors.New("the DNS record already exists")
+
+// dnsExistsError is the error of a connect refused by an existing DNS record: the operator's message, and
+// ErrDNSRecordExists for errors.Is.
+type dnsExistsError struct{ host string }
+
+func (e dnsExistsError) Error() string {
+	return e.host + " already has a DNS record; run again with --overwrite-dns to point it at this tunnel"
+}
+
+func (dnsExistsError) Unwrap() error { return ErrDNSRecordExists }
 
 // Runner runs the cloudflared CLI.
 type Runner interface {
@@ -196,9 +214,29 @@ func (c *Connector) Connect(ctx context.Context, o ConnectOptions, out io.Writer
 		return Record{}, errors.New("another `cloudflare connect` is running")
 	}
 	defer c.mu.Unlock()
-	host := strings.ToLower(strings.TrimSpace(o.Hostname))
+	return c.connect(ctx, o, out, nil)
+}
+
+// normalizeHost checks a hostname the operator typed and returns it in lower case.
+func normalizeHost(s string) (string, error) {
+	host := strings.ToLower(strings.TrimSpace(s))
 	if len(host) > 253 || !hostnameRe.MatchString(host) {
-		return Record{}, fmt.Errorf("%w: %q is not a full host name, e.g. hub.example.com", ErrHostname, o.Hostname)
+		return "", fmt.Errorf("%w: %q is not a full host name, e.g. hub.example.com", ErrHostname, s)
+	}
+	return host, nil
+}
+
+// connect is the flow of Connect and Start; the caller holds c.mu. It reports every step to progress (when not nil).
+func (c *Connector) connect(ctx context.Context, o ConnectOptions, out io.Writer, progress func(Step)) (rec Record, err error) {
+	r := &reporter{fn: progress}
+	defer func() {
+		if err != nil {
+			r.fail(err)
+		}
+	}()
+	host, err := normalizeHost(o.Hostname)
+	if err != nil {
+		return Record{}, err
 	}
 	if err := os.MkdirAll(c.dir, 0o700); err != nil {
 		return Record{}, err
@@ -214,12 +252,14 @@ func (c *Connector) Connect(ctx context.Context, o ConnectOptions, out io.Writer
 	env := []string{"HOME=" + home, "TUNNEL_ORIGIN_CERT=" + cert, "PATH=" + home}
 
 	// 1. Login.
+	r.begin(StepLogin)
 	_, _ = fmt.Fprintf(out, "Step 1/4: authorize Cloudflare. Open the link below, sign in and pick the zone of %s.\n", host)
 	lctx, cancel := context.WithTimeout(ctx, LoginTimeout)
 	shown := false
 	lout, err := c.runner.Run(lctx, env, []string{"tunnel", "login"}, func(l string) {
 		if m := loginURLRe.FindString(l); m != "" && !shown {
 			shown = true
+			r.loginURL(m)
 			_, _ = fmt.Fprintf(out, "\n  %s\n\nWaiting for the authorization. cloudflared gives up after a few minutes "+
 				"(about four); then run this command again for a fresh link.\n", m)
 		}
@@ -230,14 +270,18 @@ func (c *Connector) Connect(ctx context.Context, o ConnectOptions, out io.Writer
 			lastLine(lout, err))
 	}
 	_, _ = fmt.Fprintln(out, "Authorized.")
+	r.done()
 
 	// 2. The tunnel.
-	rec, err := c.tunnel(ctx, env, host, out)
+	r.begin(StepTunnel)
+	rec, err = c.tunnel(ctx, env, host, out)
 	if err != nil {
 		return Record{}, err
 	}
+	r.done()
 
 	// 3. DNS.
+	r.begin(StepDNS)
 	_, _ = fmt.Fprintf(out, "Step 3/4: point %s at the tunnel.\n", host)
 	args := []string{"tunnel", "route", "dns"}
 	if o.OverwriteDNS {
@@ -245,12 +289,14 @@ func (c *Connector) Connect(ctx context.Context, o ConnectOptions, out io.Writer
 	}
 	if dout, err := c.run(ctx, env, append(args, rec.ID, host)...); err != nil {
 		if existsRe.MatchString(dout) {
-			return Record{}, fmt.Errorf("%s already has a DNS record; run again with --overwrite-dns to point it at this tunnel", host)
+			return Record{}, dnsExistsError{host: host}
 		}
 		return Record{}, fmt.Errorf("could not add the DNS record: %s", lastLine(dout, err))
 	}
+	r.done()
 
 	// 4. Config.
+	r.begin(StepConfig)
 	rec.Hostname = host
 	if err := c.writeRecord(rec); err != nil {
 		return Record{}, err
@@ -268,6 +314,7 @@ func (c *Connector) Connect(ctx context.Context, o ConnectOptions, out io.Writer
 	if c.startHint != "" {
 		_, _ = fmt.Fprintf(out, "Start it: %s\n", c.startHint)
 	}
+	r.done()
 	return rec, nil
 }
 
@@ -323,11 +370,12 @@ func (c *Connector) writeRecord(r Record) error {
 	return writeFile(filepath.Join(c.dir, RecordFile), append(b, '\n'))
 }
 
-// config is cloudflared's config.yml. Every value is checked (host, tunnel id) or the operator's own (service).
+// config is cloudflared's config.yml. Every value is checked (host, tunnel id) or the operator's own (service); the
+// credentials path is quoted, since a directory name may hold ": " or " #" (review R-14).
 func (c *Connector) config(r Record) string {
 	return strings.Join([]string{
 		"tunnel: " + r.ID,
-		"credentials-file: " + filepath.Join(c.dir, CredentialsFile),
+		"credentials-file: " + yamlQuote(filepath.Join(c.dir, CredentialsFile)),
 		"no-autoupdate: true",
 		"ingress:",
 		"  - hostname: " + r.Hostname,
@@ -336,6 +384,9 @@ func (c *Connector) config(r Record) string {
 		"",
 	}, "\n")
 }
+
+// yamlQuote is s as a YAML single-quoted scalar: nothing inside is special but the quote, which is doubled.
+func yamlQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
 
 // writeFile replaces path atomically with mode 0600.
 func writeFile(path string, data []byte) error {

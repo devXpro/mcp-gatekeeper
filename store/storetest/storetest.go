@@ -19,6 +19,10 @@
 //   - AccountStore.Delete runs Cascade.DeletePerson for every person of the account, then Cascade.DeleteAccount;
 //     PersonStore.Delete runs Cascade.DeletePerson. Every Cascade runs inside the delete's transaction, and an error
 //     from one rolls the whole delete back;
+//   - a person and an invite keep an access term (AccessUntil) and permission ids; no permissions (nil or empty) read
+//     back as nil, and SetAccess replaces both, clearing what it is given nothing for;
+//   - an adapter that implements store.Purger (it has no TTL indexes) deletes with Purge what the TTL indexes of the
+//     MongoDB adapter would: see the Purge test for the retention. Adapters without a Purger skip that test;
 //   - Tx: commit, rollback on an error from fn, a Tx inside a Tx joins the outer one, and a write inside an open
 //     transaction is invisible to a reader outside it until the commit (a reader outside never waits for it).
 //
@@ -53,9 +57,11 @@ func Run(t *testing.T, open Open) {
 	}{
 		{"Accounts", testAccounts},
 		{"People", testPeople},
+		{"PersonAccess", testPersonAccess},
 		{"Passkeys", testPasskeys},
 		{"Sessions", testSessions},
 		{"Invites", testInvites},
+		{"InviteAccess", testInviteAccess},
 		{"InviteConsumeConcurrent", testInviteConsumeConcurrent},
 		{"OAuthClients", testOAuthClients},
 		{"OAuthCodes", testOAuthCodes},
@@ -64,6 +70,7 @@ func Run(t *testing.T, open Open) {
 		{"RevokeGrantsByResource", testRevokeGrantsByResource},
 		{"UseRefresh", testUseRefresh},
 		{"UseRefreshConcurrent", testUseRefreshConcurrent},
+		{"Purge", testPurge},
 		{"Audit", testAudit},
 		{"AuditLimits", testAuditLimits},
 		{"Tx", testTx},

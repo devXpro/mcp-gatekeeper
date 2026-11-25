@@ -2,7 +2,11 @@
 // application with one household and one file; Family Hub uses package mongostore. Both pass the one conformance suite,
 // package storetest.
 //
-// The database file is opened in WAL mode with foreign keys on and a busy timeout. Every gatekeeper table is named
+// The database file is opened in WAL mode with full synchronous commits (a commit that returned survives a power
+// cut), foreign keys on and a busy timeout. The file, its -wal and -shm are 0600 and their directory 0700; Open
+// tightens looser modes and logs a warning when it had to. It tightens a directory only when it is the database's own
+// (Open created it, or it is the process user's and holds nothing but the database's files) and refuses to open in
+// any other directory that is not 0700. Every gatekeeper table is named
 // gk_*, so an application's own tables can live in the same file without a clash; times are INTEGER Unix
 // milliseconds in UTC (the precision every adapter keeps), secrets and tokens only as sha256 BLOBs.
 //
@@ -38,9 +42,11 @@ package sqlitestore
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/url"
 	"os"
@@ -62,7 +68,10 @@ const (
 
 // Options configures a Store.
 type Options struct {
-	// Path is the database file; it is created (mode 0600, its directory 0700) when missing. Required.
+	// Path is the database file; it is created (mode 0600, its directory 0700) when missing, and an existing file,
+	// -wal or -shm with other modes is set to those (with a warning). Use a directory of its own: an existing directory
+	// that is not 0700 is tightened only when it belongs to the process user and holds nothing but the database's
+	// files, and Open fails otherwise (it never chmods a shared directory). Required.
 	Path string
 	// Cascades run inside the transaction of an account or person delete, after the store's own deletes.
 	Cascades []store.Cascade
@@ -129,7 +138,7 @@ func Open(ctx context.Context, o Options) (*Store, error) {
 		maxConns = defaultMaxConns
 	}
 
-	path, err := prepareFile(o.Path)
+	path, err := prepareFile(o.Path, log)
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +148,7 @@ func Open(ctx context.Context, o Options) (*Store, error) {
 	q.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busy.Milliseconds()))
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Add("_pragma", "journal_mode(WAL)")
-	q.Add("_pragma", "synchronous(NORMAL)")
+	q.Add("_pragma", "synchronous(FULL)")
 	q.Set("_txlock", "immediate")
 	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}).String()
 
@@ -161,18 +170,38 @@ func Open(ctx context.Context, o Options) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := s.audit.seed(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	// The -wal and -shm files exist now (they may also be left over from a process that crashed).
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := restrict(path+suffix, 0o600, log); err != nil && !errors.Is(err, os.ErrNotExist) {
+			_ = db.Close()
+			return nil, err
+		}
+	}
 	return s, nil
 }
 
-// prepareFile creates the directory and the file with restrictive modes (SQLite gives -wal and -shm the main file's
-// mode) and returns the absolute path.
-func prepareFile(path string) (string, error) {
+// prepareFile creates the directory and the file with restrictive modes and tightens the modes of ones that exist
+// (SQLite gives -wal and -shm the main file's mode). It returns the absolute path.
+func prepareFile(path string, log *slog.Logger) (string, error) {
 	path, err := filepath.Abs(path)
 	if err != nil {
 		return "", fmt.Errorf("sqlitestore: database path: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
 		return "", fmt.Errorf("sqlitestore: create data dir: %w", err)
+	}
+	err = os.Mkdir(dir, 0o700)
+	created := err == nil
+	if err != nil && !errors.Is(err, fs.ErrExist) {
+		return "", fmt.Errorf("sqlitestore: create data dir: %w", err)
+	}
+	if err := restrictDir(dir, filepath.Base(path), created, log); err != nil {
+		return "", err
 	}
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600) //nolint:gosec // the operator's own database path
 	if err != nil {
@@ -181,7 +210,73 @@ func prepareFile(path string) (string, error) {
 	if err := f.Close(); err != nil {
 		return "", fmt.Errorf("sqlitestore: create database file: %w", err)
 	}
+	if err := restrict(path, 0o600, log); err != nil {
+		return "", err
+	}
 	return path, nil
+}
+
+// restrictDir makes the database's directory 0700, but only when it is the database's own (review R-8): one Open has
+// just created, or one of the process user that holds nothing but this database's files. A shared directory with
+// another mode (/tmp, a home directory, a volume root) is refused, never chmodded; a 0700 one is fine as it is.
+func restrictDir(dir, base string, created bool, log *slog.Logger) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("sqlitestore: stat %s: %w", dir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("sqlitestore: %s is not a directory", dir)
+	}
+	if info.Mode().Perm() == 0o700 {
+		return nil
+	}
+	if !created {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return fmt.Errorf("sqlitestore: read %s: %w", dir, err)
+		}
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		if problem := sharedDir(info, names, base); problem != "" {
+			return fmt.Errorf("sqlitestore: the database's directory %s has mode %s, not 0700, and %s, so Open will "+
+				"not change it: use a directory of its own for the database", dir, info.Mode().Perm(), problem)
+		}
+	}
+	return restrict(dir, 0o700, log)
+}
+
+// sharedDir says why a directory holding names is not the database's own to chmod, or "" when it is: it belongs to
+// the process user and holds only the database file base and its -wal, -shm and -journal.
+func sharedDir(info fs.FileInfo, names []string, base string) string {
+	if !ownedByProcessUser(info) {
+		return "it belongs to another user"
+	}
+	for _, n := range names {
+		switch n {
+		case base, base + "-wal", base + "-shm", base + "-journal":
+		default:
+			return fmt.Sprintf("it holds other files (%s)", n)
+		}
+	}
+	return ""
+}
+
+// restrict sets the mode of path to want when it is anything else, and says so in a warning: the data was readable
+// by others (or unusable by its owner) until now. A path that does not exist is os.ErrNotExist.
+func restrict(path string, want os.FileMode, log *slog.Logger) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("sqlitestore: stat %s: %w", path, err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		if err := os.Chmod(path, want); err != nil {
+			return fmt.Errorf("sqlitestore: set the mode of %s: %w", path, err)
+		}
+		log.Warn("sqlitestore: file mode corrected", "path", path, "was", got.String(), "now", want.String())
+	}
+	return nil
 }
 
 // Accounts implements store.Store.
@@ -392,4 +487,32 @@ func boolInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// encodePermissions stores a list of permission ids as a JSON array; none (nil or empty) is NULL, so both read back
+// as nil, as in the MongoDB adapter.
+func encodePermissions(perms []string) (any, error) {
+	if len(perms) == 0 {
+		return nil, nil //nolint:nilnil // NULL is the stored form of "none"
+	}
+	raw, err := json.Marshal(perms)
+	if err != nil {
+		return nil, err
+	}
+	return string(raw), nil
+}
+
+// decodePermissions is the inverse of encodePermissions.
+func decodePermissions(v sql.NullString) ([]string, error) {
+	if !v.Valid {
+		return nil, nil
+	}
+	var perms []string
+	if err := json.Unmarshal([]byte(v.String), &perms); err != nil {
+		return nil, err
+	}
+	if len(perms) == 0 {
+		return nil, nil
+	}
+	return perms, nil
 }

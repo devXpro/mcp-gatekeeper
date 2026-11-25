@@ -89,6 +89,12 @@ func (a *Auth) loginFinish(w http.ResponseWriter, r *http.Request) {
 		a.loginFailed(w, r)
 		return
 	}
+	if !person.Active(now) {
+		// The passkey verified, so its holder may learn why: a guest whose term ended, until the owner extends it.
+		a.log.Info("auth: sign-in refused: the access term has ended", slog.String("person", string(person.ID)))
+		a.fail(w, r, errAccessEnded)
+		return
+	}
 	account, err := a.st.Accounts().Get(ctx, person.AccountID)
 	if errors.Is(err, core.ErrNotFound) {
 		a.loginFailed(w, r)
@@ -133,7 +139,7 @@ func (a *Auth) stepUpBegin(w http.ResponseWriter, r *http.Request) {
 	}
 	creds := usableCreds(pks)
 	if len(creds) == 0 {
-		a.fail(w, r, errNoPasskey)
+		a.fail(w, r, a.errNoPasskey())
 		return
 	}
 	assertion, data, err := a.wa.BeginLogin(user{id: v.Person.ID, name: v.Person.Name, creds: creds, rp: a.brand.Product})

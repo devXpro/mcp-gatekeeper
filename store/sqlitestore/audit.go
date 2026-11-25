@@ -35,6 +35,28 @@ type auditIDs struct {
 	last uint64
 }
 
+// seed raises the counter to the highest one in the table, so an id made after a restart sorts after every id already
+// stored even when the clock is behind (it was stepped back, or the file came from a faster clock). Ids that are not
+// ours are ignored.
+func (a *auditIDs) seed(ctx context.Context, q Conn) error {
+	var newest sql.NullString
+	if err := q.QueryRowContext(ctx, `SELECT MAX(id) FROM gk_audit`).Scan(&newest); err != nil {
+		return fmt.Errorf("sqlitestore: read the newest audit id: %w", err)
+	}
+	if !newest.Valid {
+		return nil
+	}
+	id, ok := validAuditID(newest.String)
+	if !ok {
+		return nil
+	}
+	b, _ := hex.DecodeString(id) // validAuditID checked it
+	a.mu.Lock()
+	a.last = max(a.last, binary.BigEndian.Uint64(b[:8]))
+	a.mu.Unlock()
+	return nil
+}
+
 func (a *auditIDs) next(nowMS int64) string {
 	a.mu.Lock()
 	seq := uint64(nowMS) << 16 //nolint:gosec // milliseconds since the epoch are positive

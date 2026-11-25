@@ -7,6 +7,8 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+
+	"github.com/devXpro/mcp-gatekeeper/core"
 )
 
 // pageText is the message of an error page, in Russian and English.
@@ -43,6 +45,19 @@ var (
 		EN: "Something went wrong on the server. Try again later.",
 	}
 )
+
+// metadataInvalidText is pageMetadataInvalid in b's words (review GK-18): Family Hub's text while b.AppNoun is empty;
+// otherwise the English names the application by b.AppNoun and the Russian by b.Product, since the brand's nouns are
+// English.
+func metadataInvalidText(b core.Brand) pageText {
+	if b.AppNoun == "" {
+		return pageMetadataInvalid
+	}
+	return pageText{
+		RU: "Описание клиента от ассистента не подходит для " + b.Product + ".",
+		EN: "The assistant's client description does not fit this " + b.AppNoun + ".",
+	}
+}
 
 // pageData is what the page template shows: the product's name as the title and the message.
 type pageData struct {

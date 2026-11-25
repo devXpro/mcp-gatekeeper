@@ -19,6 +19,7 @@ import (
 // fakeData is the state behind fakeStore.
 type fakeData struct {
 	mu      sync.Mutex
+	people  map[core.PersonID]core.Person
 	clients map[core.ClientID]core.OAuthClient
 	codes   map[string]core.AuthCode
 	grants  map[core.GrantID]core.Grant
@@ -30,6 +31,7 @@ type fakeData struct {
 }
 
 type fakeSnapshot struct {
+	people  map[core.PersonID]core.Person
 	clients map[core.ClientID]core.OAuthClient
 	codes   map[string]core.AuthCode
 	grants  map[core.GrantID]core.Grant
@@ -39,13 +41,14 @@ type fakeSnapshot struct {
 
 func (d *fakeData) snapshot() fakeSnapshot {
 	return fakeSnapshot{
-		clients: maps.Clone(d.clients), codes: maps.Clone(d.codes), grants: maps.Clone(d.grants),
-		tokens: maps.Clone(d.tokens), audit: slices.Clone(d.audit),
+		people: maps.Clone(d.people), clients: maps.Clone(d.clients), codes: maps.Clone(d.codes),
+		grants: maps.Clone(d.grants), tokens: maps.Clone(d.tokens), audit: slices.Clone(d.audit),
 	}
 }
 
 func (d *fakeData) restore(s fakeSnapshot) {
-	d.clients, d.codes, d.grants, d.tokens, d.audit = s.clients, s.codes, s.grants, s.tokens, s.audit
+	d.people, d.clients, d.codes, d.grants, d.tokens, d.audit = s.people, s.clients, s.codes, s.grants, s.tokens,
+		s.audit
 }
 
 // failure returns the error set for method name. d.mu is held.
@@ -68,8 +71,8 @@ func (d *fakeData) revokeTokens(match func(core.Token) bool, at time.Time) {
 	}
 }
 
-// fakeStore is store.Store with the OAuth and audit stores this package uses; the others are nil. It answers like
-// the adapters of the store conformance suite: Tx rolls back when fn fails, a Tx inside a Tx joins it (the
+// fakeStore is store.Store with the people, OAuth and audit stores this package uses; the others are nil. It answers
+// like the adapters of the store conformance suite: Tx rolls back when fn fails, a Tx inside a Tx joins it (the
 // transaction travels in the context), and transactions run one at a time, so a call outside one waits for a running
 // transaction.
 type fakeStore struct {
@@ -85,8 +88,8 @@ type fakeTxKey struct{}
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		data: &fakeData{
-			clients: map[core.ClientID]core.OAuthClient{}, codes: map[string]core.AuthCode{},
-			grants: map[core.GrantID]core.Grant{}, tokens: map[string]core.Token{},
+			people: map[core.PersonID]core.Person{}, clients: map[core.ClientID]core.OAuthClient{},
+			codes: map[string]core.AuthCode{}, grants: map[core.GrantID]core.Grant{}, tokens: map[string]core.Token{},
 			fail: map[string]error{}, failOnce: map[string]bool{},
 		},
 		tx: &sync.Mutex{},
@@ -94,7 +97,7 @@ func newFakeStore() *fakeStore {
 }
 
 func (s *fakeStore) Accounts() store.AccountStore { return nil }
-func (s *fakeStore) People() store.PersonStore    { return nil }
+func (s *fakeStore) People() store.PersonStore    { return fakePeople{s} }
 func (s *fakeStore) Passkeys() store.PasskeyStore { return nil }
 func (s *fakeStore) Sessions() store.SessionStore { return nil }
 func (s *fakeStore) Invites() store.InviteStore   { return nil }
@@ -145,6 +148,13 @@ func (s *fakeStore) failWith(method string, err error, once bool) {
 	defer s.lock(context.Background())()
 	s.data.fail[method] = err
 	s.data.failOnce[method] = once
+}
+
+// person returns a stored person as it is now, without the failures of failWith.
+func (s *fakeStore) person(id core.PersonID) (core.Person, bool) {
+	defer s.lock(context.Background())()
+	p, ok := s.data.people[id]
+	return p, ok
 }
 
 func (s *fakeStore) client(id string) (core.OAuthClient, bool) {
@@ -207,6 +217,95 @@ func (s *fakeStore) auditActions() map[string]int {
 }
 
 func fakeNotFound(what string) error { return fmt.Errorf("fake %s: %w", what, core.ErrNotFound) }
+
+// fakePeople is the people store over the fake's map. failWith("GetPerson", …) makes Get fail.
+type fakePeople struct{ s *fakeStore }
+
+func (p fakePeople) Create(ctx context.Context, person core.Person) error {
+	defer p.s.lock(ctx)()
+	if _, ok := p.s.data.people[person.ID]; ok {
+		return fmt.Errorf("fake person: %w", core.ErrConflict)
+	}
+	p.s.data.people[person.ID] = person
+	return nil
+}
+
+func (p fakePeople) Get(ctx context.Context, id core.PersonID) (core.Person, error) {
+	defer p.s.lock(ctx)()
+	d := p.s.data
+	if err := d.failure("GetPerson"); err != nil {
+		return core.Person{}, err
+	}
+	person, ok := d.people[id]
+	if !ok {
+		return core.Person{}, fakeNotFound("person")
+	}
+	return person, nil
+}
+
+func (p fakePeople) ListByAccount(ctx context.Context, a core.AccountID) ([]core.Person, error) {
+	defer p.s.lock(ctx)()
+	var out []core.Person
+	for _, person := range p.s.data.people {
+		if person.AccountID == a {
+			out = append(out, person)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (p fakePeople) CountSuperadmins(ctx context.Context) (int, error) {
+	defer p.s.lock(ctx)()
+	n := 0
+	for _, person := range p.s.data.people {
+		if person.Superadmin {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (p fakePeople) Rename(ctx context.Context, id core.PersonID, name string) error {
+	return p.update(ctx, id, func(person *core.Person) { person.Name = name })
+}
+
+func (p fakePeople) Disable(ctx context.Context, id core.PersonID, at time.Time) error {
+	return p.update(ctx, id, func(person *core.Person) { person.DisabledAt = &at })
+}
+
+func (p fakePeople) SetAccess(ctx context.Context, id core.PersonID, until *time.Time, perms []string) error {
+	return p.update(ctx, id, func(person *core.Person) { person.AccessUntil, person.Permissions = until, perms })
+}
+
+// Delete removes the person with their grants and those grants' tokens, as the stores do.
+func (p fakePeople) Delete(ctx context.Context, id core.PersonID) error {
+	defer p.s.lock(ctx)()
+	d := p.s.data
+	if _, ok := d.people[id]; !ok {
+		return fakeNotFound("person")
+	}
+	delete(d.people, id)
+	for gid, g := range d.grants {
+		if g.PersonID == id {
+			delete(d.grants, gid)
+			maps.DeleteFunc(d.tokens, func(_ string, t core.Token) bool { return t.GrantID == gid })
+		}
+	}
+	return nil
+}
+
+// update changes a stored person with edit.
+func (p fakePeople) update(ctx context.Context, id core.PersonID, edit func(*core.Person)) error {
+	defer p.s.lock(ctx)()
+	person, ok := p.s.data.people[id]
+	if !ok {
+		return fakeNotFound("person")
+	}
+	edit(&person)
+	p.s.data.people[id] = person
+	return nil
+}
 
 type fakeOAuth struct{ s *fakeStore }
 
@@ -522,13 +621,16 @@ func (a fakeAudit) list(ctx context.Context, match func(core.AuditEntry) bool, b
 // testCookie names the viewer of a request to fakeSessions.
 const testCookie = "fh_test"
 
-// fakeSessions signs a request in by the cookie testCookie, whose value is a key of viewers. With a clock, a
-// session's step-up is fresh for 5 minutes from now, as package auth makes it after a sign-in, unless the person is
-// marked stale. Its RequireViewer keeps the contract of core.Sessions: a mutating request first passes the CSRF
-// checks of docs/PLAN.md §4.4 (403 forbidden), then a request without a session is 401 no_session.
+// fakeSessions signs a request in by the cookie testCookie, whose value is a key of viewers. With a store, the viewer's
+// person is the stored one, as package auth reads it on every request; unlike package auth, a person who is not
+// active keeps the session, so the tests reach the consent API's own check. With a clock, a session's step-up is
+// fresh for 5 minutes from now, as package auth makes it after a sign-in, unless the person is marked stale. Its
+// RequireViewer keeps the contract of core.Sessions: a mutating request first passes the CSRF checks of docs/PLAN.md
+// §4.4 (403 forbidden), then a request without a session is 401 no_session.
 type fakeSessions struct {
 	viewers map[string]core.Viewer
 	clock   *fakeClock
+	store   *fakeStore
 
 	mu    sync.Mutex
 	stale map[string]bool // persons whose session stepped up longer than 5 minutes ago
@@ -544,6 +646,11 @@ func (f *fakeSessions) Viewer(r *http.Request) (core.Viewer, error) {
 	v, ok := f.viewers[c.Value]
 	if !ok {
 		return core.Viewer{}, core.ErrNoSession
+	}
+	if f.store != nil {
+		if p, ok := f.store.person(v.Person.ID); ok {
+			v.Person = p
+		}
 	}
 	f.mu.Lock()
 	stale := f.stale[c.Value]

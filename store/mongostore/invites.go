@@ -22,6 +22,9 @@ type inviteDoc struct {
 	ExpiresAt time.Time  `bson:"expires_at"`
 	UsedAt    *time.Time `bson:"used_at,omitempty"`
 	RevokedAt *time.Time `bson:"revoked_at,omitempty"`
+	// Absent on an invite that offers neither, like Family Hub's own documents.
+	AccessUntil *time.Time `bson:"access_until,omitempty"`
+	Permissions []string   `bson:"permissions,omitempty"`
 }
 
 func (d inviteDoc) toCore() core.Invite {
@@ -29,6 +32,7 @@ func (d inviteDoc) toCore() core.Invite {
 		ID: d.ID, TokenHash: d.TokenHash, Kind: core.InviteKind(d.Kind), AccountID: core.AccountID(d.AccountID),
 		Name: d.Name, CreatedBy: core.PersonID(d.CreatedBy), CreatedAt: utc(d.CreatedAt), ExpiresAt: utc(d.ExpiresAt),
 		UsedAt: optTime(d.UsedAt), RevokedAt: optTime(d.RevokedAt),
+		AccessUntil: optTime(d.AccessUntil), Permissions: d.Permissions,
 	}
 }
 
@@ -39,6 +43,7 @@ func (i inviteStore) Create(ctx context.Context, inv core.Invite) error {
 		ID: inv.ID, TokenHash: inv.TokenHash, Kind: string(inv.Kind), AccountID: string(inv.AccountID), Name: inv.Name,
 		CreatedBy: string(inv.CreatedBy), CreatedAt: inv.CreatedAt, ExpiresAt: inv.ExpiresAt,
 		UsedAt: optTime(inv.UsedAt), RevokedAt: optTime(inv.RevokedAt),
+		AccessUntil: optTime(inv.AccessUntil), Permissions: inv.Permissions,
 	})
 }
 

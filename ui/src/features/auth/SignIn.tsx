@@ -15,10 +15,13 @@ import { passkeyKind } from '../../lib/platform'
 // page and the consent page (when there is no session yet) both use it. Passkeys only: discoverable credentials, so
 // nobody types a user name.
 
-type State = 'idle' | 'waiting' | 'cancelled' | 'failed' | 'limited' | 'error'
+type State = 'idle' | 'waiting' | 'cancelled' | 'failed' | 'ended' | 'limited' | 'error'
 
 /** Codes a refused login can come back with: the passkey does not belong to anyone here. */
 const REFUSED = ['invalid', 'forbidden', 'not_found', 'no_session']
+
+/** accessEnded tells the one refusal that is not about the passkey: its holder's access term is over (403 access_ended). */
+const accessEnded = (err: unknown) => isApiError(err, 'access_ended')
 
 export function SignInPanel({ title, subtitle, onSignedIn, footnote }: { title: ReactNode; subtitle?: ReactNode; onSignedIn: () => void | Promise<void>; footnote?: string }) {
   const { t } = useTranslation()
@@ -35,7 +38,8 @@ export function SignInPanel({ title, subtitle, onSignedIn, footnote }: { title: 
       await signIn()
       await onSignedIn()
     } catch (err) {
-      if (isApiError(err) && REFUSED.includes(err.code)) setState('failed')
+      if (accessEnded(err)) setState('ended')
+      else if (isApiError(err) && REFUSED.includes(err.code)) setState('failed')
       else if (isApiError(err, 'rate_limited')) {
         setRetryAt(Date.now() + (err.retryAfter ?? 60) * 1000)
         setState('limited')
@@ -52,11 +56,13 @@ export function SignInPanel({ title, subtitle, onSignedIn, footnote }: { title: 
       ? { text: t('login.cancelled'), tone: 'muted' }
       : state === 'failed'
         ? { text: t('login.failed'), tone: 'danger' }
-        : limited
-          ? { text: t('error.rate_limited'), tone: 'danger' }
-          : state === 'error'
-            ? { text: error, tone: 'danger' }
-            : { text: footnote ?? t('login.footnote'), tone: 'muted' }
+        : state === 'ended'
+          ? { text: t('login.ended'), tone: 'danger' }
+          : limited
+            ? { text: t('error.rate_limited'), tone: 'danger' }
+            : state === 'error'
+              ? { text: error, tone: 'danger' }
+              : { text: footnote ?? t('login.footnote'), tone: 'muted' }
 
   return (
     <div className="flex w-full max-w-[360px] flex-col items-center text-center">

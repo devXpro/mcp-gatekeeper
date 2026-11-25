@@ -8,6 +8,10 @@
 //
 // The application plugs in through small interfaces (see Options): the Inviter (package auth), the GrantRevoker
 // (package oauth), and the optional AccountFields, SummaryFields, Eraser and ConnectionSource of its own.
+//
+// Three options serve an application that gives people limited access (Homie): Permissions offers access terms and
+// the application's permissions on invites and members, CoOwners lets the superadmin invite more owners into their
+// own account, and SingleAccount turns account creation and deletion off. Without them every answer is as before.
 package people
 
 import (
@@ -31,6 +35,7 @@ const (
 	ActionInviteCreate = "account.invite.create"
 	ActionInviteRevoke = "account.invite.revoke"
 	ActionMemberRemove = "account.member.remove"
+	ActionMemberUpdate = "account.member.update"
 	ActionCreate       = "account.create"
 	ActionDelete       = "account.delete"
 	ActionDeleteFail   = "account.delete.fail"
@@ -61,6 +66,16 @@ type Inviter interface {
 	// IssueInviteIn is IssueInvite on st; the transaction travels in ctx.
 	IssueInviteIn(ctx context.Context, st store.Store, kind core.InviteKind, account core.AccountID, name string,
 		by core.PersonID) (IssuedInvite, error)
+}
+
+// AccessInviter is an Inviter that also gives a member invite an access term and permissions (core.Invite.AccessUntil
+// and Permissions), which the person who redeems it gets. Options.Permissions requires one, so a term is never lost
+// on the way to the invite.
+type AccessInviter interface {
+	Inviter
+	// IssueInviteWithAccess is IssueInvite with the term (nil: no end) and the permissions (nil: none) of the invite.
+	IssueInviteWithAccess(ctx context.Context, kind core.InviteKind, account core.AccountID, name string,
+		by core.PersonID, until *time.Time, perms []string) (IssuedInvite, error)
 }
 
 // GrantRevoker revokes a connection and audits it; (*oauth.Server).RevokeGrant implements it.
@@ -107,6 +122,18 @@ type Options struct {
 	Summaries   SummaryFields    // nil: GET /api/admin/accounts has no fields of the application
 	Connections ConnectionSource // nil: the connections are the OAuth grants only
 
+	// Permissions offers access terms and the application's permissions: member invites take access_until and
+	// permissions, PATCH /api/account/members/{id} changes them, and GET /api/account lists them with "active". The
+	// Inviter must then be an AccessInviter. nil refuses both fields and leaves every answer as before.
+	Permissions core.PermissionCatalog
+	// CoOwners lets the superadmin invite owners into their own account (an invite with role "owner"). Only the
+	// superadmin then changes or removes an owner, revokes an owner's connection, withdraws an owner invite, or
+	// deletes an account that holds another owner; owners manage the members. false refuses "role".
+	CoOwners bool
+	// SingleAccount is for an application with one account: POST and DELETE /api/admin/accounts answer 404, and
+	// GET /api/admin/accounts lists the superadmin's own account only.
+	SingleAccount bool
+
 	Log   *slog.Logger // nil discards
 	Clock core.Clock   // nil is the system clock
 }
@@ -139,6 +166,12 @@ func New(o Options) (*Service, error) {
 	}
 	if !strings.HasPrefix(o.Brand.SessionCookie, "__Host-") {
 		return nil, errors.New("people: Brand.SessionCookie must start with __Host-")
+	}
+	if err := o.Site.Validate(); err != nil {
+		return nil, fmt.Errorf("people: %w", err)
+	}
+	if _, ok := o.Inviter.(AccessInviter); o.Permissions != nil && !ok {
+		return nil, errors.New("people: Options.Permissions needs an Inviter that is an AccessInviter")
 	}
 	log := o.Log
 	if log == nil {
@@ -185,7 +218,8 @@ func (s *Service) Members(ctx context.Context, a core.AccountID) ([]core.Person,
 	return ps, nil
 }
 
-// Invites returns the live member invites of account a: not used, not withdrawn, not expired.
+// Invites returns the live member invites of account a, and its owner invites with Options.CoOwners: not used, not
+// withdrawn, not expired.
 func (s *Service) Invites(ctx context.Context, a core.AccountID) ([]core.Invite, error) {
 	list, err := s.st.Invites().ListByAccount(ctx, a)
 	if err != nil {
@@ -193,7 +227,8 @@ func (s *Service) Invites(ctx context.Context, a core.AccountID) ([]core.Invite,
 	}
 	now := s.now()
 	return slices.DeleteFunc(list, func(inv core.Invite) bool {
-		return inv.Kind != core.InviteMember || !now.Before(inv.ExpiresAt)
+		listed := inv.Kind == core.InviteMember || s.o.CoOwners && inv.Kind == core.InviteOwner
+		return !listed || !now.Before(inv.ExpiresAt)
 	}), nil
 }
 
@@ -201,27 +236,91 @@ func (s *Service) Invites(ctx context.Context, a core.AccountID) ([]core.Invite,
 // ErrInvalidName. The URL holds the token: it goes to the asker only, never to a log or the audit.
 func (s *Service) CreateInvite(ctx context.Context, a core.AccountID, name string, by core.PersonID,
 	ip string) (IssuedInvite, error) {
+	return s.Invite(ctx, a, InviteSpec{Name: name}, by, ip)
+}
+
+// InviteSpec is an invite Service.Invite makes.
+type InviteSpec struct {
+	Name string
+	// Role is core.RoleMember, or empty, for a member. core.RoleOwner makes a co-owner of the account: only with
+	// Options.CoOwners, only by the superadmin into their own account, and with no term or permissions.
+	Role core.Role
+	// AccessUntil and Permissions are the member's term (nil: no end) and permissions (nil: none), copied to the
+	// person who redeems the invite. Only with Options.Permissions; see Service.Invite for the rules.
+	AccessUntil *time.Time
+	Permissions []string
+}
+
+// Invite makes invite spec to account a, by from ip. A bad name wraps ErrInvalidName; a refused role, term or
+// permission is an *APIError: the term must be in the future and at most a year away, and every permission one the
+// catalog offers (or core.PermissionAll). The URL holds the token: it goes to the asker only, never to a log or the
+// audit.
+func (s *Service) Invite(ctx context.Context, a core.AccountID, spec InviteSpec, by core.PersonID,
+	ip string) (IssuedInvite, error) {
 	// The inviter applies the same rule; checking here first marks a refusal as a bad name.
-	if _, err := s.normalize(name); err != nil {
+	if _, err := s.normalize(spec.Name); err != nil {
 		return IssuedInvite{}, fmt.Errorf("people: issue an invite: %w", err)
 	}
-	inv, err := s.o.Inviter.IssueInvite(ctx, core.InviteMember, a, name, by)
+	kind, detail := core.InviteMember, map[string]string{}
+	switch spec.Role {
+	case "", core.RoleMember:
+	case core.RoleOwner:
+		kind = core.InviteOwner
+	default:
+		return IssuedInvite{}, errBadRole
+	}
+	if spec.Role != "" && !s.o.CoOwners {
+		return IssuedInvite{}, errNoRole
+	}
+	if s.o.CoOwners {
+		detail["role"] = string(core.RoleMember)
+	}
+	if kind == core.InviteOwner {
+		if spec.AccessUntil != nil || spec.Permissions != nil {
+			return IssuedInvite{}, errOwnerAccess
+		}
+		if err := s.requireSuperadmin(ctx, a, by); err != nil {
+			return IssuedInvite{}, err
+		}
+		detail["role"] = string(core.RoleOwner)
+	}
+	until, perms, err := s.inviteAccess(ctx, a, spec)
+	if err != nil {
+		return IssuedInvite{}, err
+	}
+	var inv IssuedInvite
+	if ai, ok := s.o.Inviter.(AccessInviter); ok && s.o.Permissions != nil && kind == core.InviteMember {
+		inv, err = ai.IssueInviteWithAccess(ctx, kind, a, spec.Name, by, until, perms)
+	} else {
+		inv, err = s.o.Inviter.IssueInvite(ctx, kind, a, spec.Name, by)
+	}
 	if err != nil {
 		return IssuedInvite{}, fmt.Errorf("people: issue an invite: %w", err)
 	}
+	maps.Copy(detail, accessDetail(spec.AccessUntil != nil, until, spec.Permissions != nil, perms))
+	if len(detail) == 0 {
+		detail = nil
+	}
 	s.audit(ctx, core.AuditEntry{At: s.now(), AccountID: a, Actor: by, Action: ActionInviteCreate, Target: inv.ID,
-		IP: ip})
+		Detail: detail, IP: ip})
 	return inv, nil
 }
 
-// RevokeInvite withdraws live invite id of account a; an invite of another account is core.ErrNotFound.
+// RevokeInvite withdraws live invite id of account a; an invite of another account is core.ErrNotFound. With
+// Options.CoOwners an owner invite is the superadmin's to withdraw (ErrSuperadminOnly).
 func (s *Service) RevokeInvite(ctx context.Context, a core.AccountID, id string, by core.PersonID, ip string) error {
 	list, err := s.st.Invites().ListByAccount(ctx, a)
 	if err != nil {
 		return fmt.Errorf("people: list the invites: %w", err)
 	}
-	if !slices.ContainsFunc(list, func(inv core.Invite) bool { return inv.ID == id }) {
+	i := slices.IndexFunc(list, func(inv core.Invite) bool { return inv.ID == id })
+	if i < 0 {
 		return fmt.Errorf("people: invite %q: %w", id, core.ErrNotFound)
+	}
+	if s.o.CoOwners && list[i].Kind == core.InviteOwner {
+		if err := s.requireSuperadmin(ctx, a, by); err != nil {
+			return err
+		}
 	}
 	now := s.now()
 	return s.st.Tx(ctx, func(ctx context.Context) error {
@@ -234,19 +333,25 @@ func (s *Service) RevokeInvite(ctx context.Context, a core.AccountID, id string,
 }
 
 // RemoveMember deletes person target of account a with their passkeys, sessions and grants, by from ip. Removing
-// yourself is ErrSelf, a superadmin ErrSuperadmin, a person of another account core.ErrNotFound.
+// yourself is ErrSelf, a superadmin ErrSuperadmin, a person of another account core.ErrNotFound. With
+// Options.CoOwners, removing an owner or a superadmin takes the superadmin (ErrSuperadminOnly), and the audit entry
+// records the role of the person removed.
 func (s *Service) RemoveMember(ctx context.Context, a core.AccountID, target, by core.PersonID, ip string) error {
 	if target == by {
 		return ErrSelf
 	}
 	now := s.now()
 	return s.st.Tx(ctx, func(ctx context.Context) error {
-		p, err := s.st.People().Get(ctx, target)
-		if err == nil && p.AccountID != a {
-			err = core.ErrNotFound
-		}
+		p, err := s.member(ctx, a, target)
 		if err != nil {
-			return fmt.Errorf("people: member %q: %w", target, err)
+			return err
+		}
+		var detail map[string]string
+		if s.o.CoOwners {
+			if err := s.mayManage(ctx, a, by, p); err != nil {
+				return err
+			}
+			detail = map[string]string{"role": string(p.Role)}
 		}
 		if p.Superadmin {
 			return ErrSuperadmin
@@ -255,8 +360,41 @@ func (s *Service) RemoveMember(ctx context.Context, a core.AccountID, target, by
 			return fmt.Errorf("people: delete a member: %w", err)
 		}
 		return s.st.Audit().Append(ctx, actorname.Stamp(ctx, s.st.People(), core.AuditEntry{At: now, AccountID: a,
-			Actor: by, Action: ActionMemberRemove, Target: string(target), IP: ip}))
+			Actor: by, Action: ActionMemberRemove, Target: string(target), Detail: detail, IP: ip}))
 	})
+}
+
+// member returns person id of account a; a person of another account is core.ErrNotFound.
+func (s *Service) member(ctx context.Context, a core.AccountID, id core.PersonID) (core.Person, error) {
+	p, err := s.st.People().Get(ctx, id)
+	if err == nil && p.AccountID != a {
+		err = core.ErrNotFound
+	}
+	if err != nil {
+		return core.Person{}, fmt.Errorf("people: member %q: %w", id, err)
+	}
+	return p, nil
+}
+
+// mayManage refuses (ErrSuperadminOnly) anyone but the superadmin acting on target when target is an owner or a
+// superadmin: owners manage the members, the superadmin manages the owners.
+func (s *Service) mayManage(ctx context.Context, a core.AccountID, by core.PersonID, target core.Person) error {
+	if target.Role != core.RoleOwner && !target.Superadmin {
+		return nil
+	}
+	return s.requireSuperadmin(ctx, a, by)
+}
+
+// requireSuperadmin refuses (ErrSuperadminOnly) unless person by is the superadmin and in account a.
+func (s *Service) requireSuperadmin(ctx context.Context, a core.AccountID, by core.PersonID) error {
+	actor, err := s.st.People().Get(ctx, by)
+	if errors.Is(err, core.ErrNotFound) || err == nil && (!actor.Superadmin || actor.AccountID != a) {
+		return ErrSuperadminOnly
+	}
+	if err != nil {
+		return fmt.Errorf("people: the person who asks: %w", err)
+	}
+	return nil
 }
 
 // --- accounts (the superadmin) ---

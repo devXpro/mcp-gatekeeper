@@ -1,15 +1,18 @@
 package mcpguard
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -159,4 +162,63 @@ func TestBodyCapThroughTheApplication(t *testing.T) {
 	require.Equal(t, http.StatusRequestEntityTooLarge, a.status, "chunked")
 	assert.Equal(t, httpsec.CodeInvalid, a.errorCode(t))
 	assert.Empty(t, h.upstream.requests())
+}
+
+// TestReadBodyDeadline is review GK-17 through a real server: a body that does not come in time is 408, and a body
+// read in full leaves no deadline behind that would end a long answer.
+func TestReadBodyDeadline(t *testing.T) {
+	const timeout = 100 * time.Millisecond
+	after := make(chan error, 1) // the request context's error once the handler has waited past the deadline
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := readBody(w, r, timeout); !ok {
+			return
+		}
+		select {
+		case <-r.Context().Done():
+		case <-time.After(3 * timeout):
+		}
+		after <- r.Context().Err()
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(srv.Close)
+
+	t.Run("a slow body", func(t *testing.T) {
+		// The request announces a body of 100 bytes and sends a few.
+		conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", srv.Listener.Addr().String())
+		require.NoError(t, err)
+		defer func() { _ = conn.Close() }()
+		require.NoError(t, conn.SetDeadline(time.Now().Add(failsafe)))
+		begin := time.Now()
+		_, err = io.WriteString(conn, "POST /mcp/hello HTTP/1.1\r\nHost: hub.example.com\r\n"+
+			"Content-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"jsonrpc\"")
+		require.NoError(t, err)
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusRequestTimeout, resp.StatusCode)
+		assert.Equal(t, `{"error":"invalid","message":"the request body was not sent in time"}`, string(body))
+		assert.GreaterOrEqual(t, time.Since(begin), timeout, "not before the deadline")
+		assert.True(t, resp.Close, "the connection is not kept for the rest of the body")
+	})
+	// A GET (an event stream) has no body: the server already reads ahead on its connection when ReadBody sets the
+	// deadline, and a deadline left there would end the stream's context when it passes.
+	for _, tt := range []struct {
+		method string
+		body   io.Reader
+	}{{http.MethodPost, strings.NewReader(`{}`)}, {http.MethodGet, nil}} {
+		t.Run(tt.method+": a body in time, then a long answer", func(t *testing.T) {
+			req, err := http.NewRequestWithContext(t.Context(), tt.method, srv.URL+"/mcp/hello", tt.body)
+			require.NoError(t, err)
+			resp, err := srv.Client().Do(req)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			b, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+			assert.Equal(t, "ok", string(b))
+			assert.NoError(t, wait(t, after, "the handler"), "the deadline did not end the request")
+		})
+	}
 }

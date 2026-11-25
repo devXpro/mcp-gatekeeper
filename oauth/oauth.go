@@ -12,9 +12,14 @@
 // every secret, code and token is kept only as its sha256, and a refresh token is spent on use, so one that comes
 // back revokes its whole family.
 //
+// A person acts only while core.Person.Active: the consent API, the code exchange and the refresh refuse anyone
+// disabled or past the end of their term (Person.AccessUntil), and an access token never outlives that end. The
+// grant itself stays, so a term the owner extends gives the person their connections back.
+//
 // The package came from Family Hub's internal/oauth. What it sends to the assistants and the SPA is byte-for-byte
-// what Family Hub sent, its wording included (an error text that says "module" means a resource), except the one
-// rename of the consent view (docs/security/G4.md, "Compatibility").
+// what Family Hub sent, its wording included, except the one rename of the consent view (docs/security/G4.md,
+// "Compatibility"). The texts name a resource and the application by Brand.ResourceWord and Brand.AppWord, whose
+// defaults are Family Hub's "module" and "hub".
 package oauth
 
 import (
@@ -150,10 +155,12 @@ var (
 // Options are the dependencies and switches of New.
 type Options struct {
 	// Site.PublicURL is the issuer: https://<host> without a path (http only on a loopback host). Site.ClientIP says
-	// where the client address of the rate limits and the audit comes from.
+	// where the client address of the rate limits and the audit comes from. New refuses a Site that fails
+	// Site.Validate, an empty or unknown ClientIP mode included.
 	Site core.Site
 	// Brand.TxnCookie names the cookie that binds a consent to the browser that started it; Brand.Product titles the
-	// error pages and gives the realm of a Basic challenge ("Family Hub": realm="family-hub").
+	// error pages and gives the realm of a Basic challenge ("Family Hub": realm="family-hub"); Brand.ResourceWord and
+	// Brand.AppWord are the words of the error texts ("module" and "hub" by default).
 	Brand core.Brand
 	Store store.Store
 	// Sessions resolves the signed-in person of the consent API (package auth).
@@ -195,6 +202,7 @@ type Server struct {
 	txnCookie string // the binding cookie (T2.R H1)
 	product   string // the title of the error pages
 	realm     string // the realm of a Basic challenge
+	noun, app string // Brand.ResourceWord and Brand.AppWord: what the texts call a resource and the application
 	store     store.Store
 	sessions  core.Sessions
 	catalog   core.ResourceCatalog
@@ -204,6 +212,7 @@ type Server struct {
 	fetcher   fetcher
 	metadata  []byte   // the authorization-server metadata document
 	cfg       settings // the switches of Options
+	badDoc    pageText // pageMetadataInvalid in the application's words
 
 	txns       *txnStore
 	spent      *spentCodes
@@ -231,6 +240,9 @@ func newServer(o Options, f fetcher) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := o.Site.Validate(); err != nil {
+		return nil, fmt.Errorf("oauth: %w", err)
+	}
 	if err := o.check(); err != nil {
 		return nil, err
 	}
@@ -253,6 +265,8 @@ func newServer(o Options, f fetcher) (*Server, error) {
 		txnCookie:      o.Brand.TxnCookie,
 		product:        o.Brand.Product,
 		realm:          basicRealm(o.Brand.Product),
+		noun:           o.Brand.ResourceWord(),
+		app:            o.Brand.AppWord(),
 		store:          o.Store,
 		sessions:       o.Sessions,
 		catalog:        o.Catalog,
@@ -262,6 +276,7 @@ func newServer(o Options, f fetcher) (*Server, error) {
 		fetcher:        f,
 		metadata:       metadata,
 		cfg:            cfg,
+		badDoc:         metadataInvalidText(o.Brand),
 		txns:           newTxnStore(maxTxns, maxTxnsPerGroup, maxTxnsPerClient),
 		spent:          newSpentCodes(),
 		touched:        newThrottle(touchPeriod),

@@ -26,8 +26,11 @@ type tokenResponse struct {
 	Scope        string `json:"scope"`
 }
 
-// tokenPair is what one token answer hands out.
-type tokenPair struct{ access, refresh, family string }
+// tokenPair is what one token answer hands out; expiresIn is the access token's life in whole seconds.
+type tokenPair struct {
+	access, refresh, family string
+	expiresIn               int64
+}
 
 // token is POST /oauth/token: the authorization_code and refresh_token grants, form-urlencoded, for an
 // authenticated client.
@@ -60,8 +63,9 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 }
 
 // exchangeCode is the authorization_code grant: the code is consumed, and it must be the client's, carry the same
-// redirect_uri, pass PKCE, and match the resource when one is sent. It all runs in one transaction, so a failed
-// check leaves the code to its own client, and a store failure leaves it for a retry.
+// redirect_uri, pass PKCE, and match the resource when one is sent; its grant's person must still be active. It all
+// runs in one transaction, so a failed check leaves the code to its own client, and a store failure leaves it for a
+// retry.
 func (s *Server) exchangeCode(ctx context.Context, w http.ResponseWriter, client core.OAuthClient, form url.Values,
 	now time.Time,
 ) {
@@ -105,7 +109,11 @@ func (s *Server) exchangeCode(ctx context.Context, w http.ResponseWriter, client
 		case g.RevokedAt != nil, g.ClientID != client.ID, grantExpired(g, now):
 			return errGrant
 		}
-		p, err := issue(ctx, o, g.ID, core.NewID(prefixFamily), now)
+		person, err := s.activePerson(ctx, g, now)
+		if err != nil {
+			return err
+		}
+		p, err := issue(ctx, o, g.ID, core.NewID(prefixFamily), now, person.AccessUntil)
 		if err != nil {
 			return err
 		}
@@ -136,6 +144,10 @@ func (s *Server) exchangeCode(ctx context.Context, w http.ResponseWriter, client
 // same family are issued. A spent token that comes back revokes its family and is audited as oauth.refresh.reuse;
 // a dead one is invalid_grant. Rotating never extends the grant: once it outlived grantTTL, the refresh is
 // invalid_grant and the grant is revoked, and the person consents again.
+//
+// A person who is no longer active (disabled, or past the end of their term) gets invalid_grant too, after the
+// reuse check, so a stolen token is still caught. Nothing is spent or revoked then: the owner may extend the term,
+// and the connection works again.
 func (s *Server) refresh(ctx context.Context, w http.ResponseWriter, client core.OAuthClient, form url.Values,
 	now time.Time, ip string,
 ) {
@@ -193,7 +205,11 @@ func (s *Server) refresh(ctx context.Context, w http.ResponseWriter, client core
 		case resource != "" && resource != s.resourceURL(g.ResourceID):
 			return errTarget
 		}
-		p, err := issue(ctx, o, g.ID, t.Family, now)
+		person, err := s.activePerson(ctx, g, now)
+		if err != nil {
+			return err
+		}
+		p, err := issue(ctx, o, g.ID, t.Family, now, person.AccessUntil)
 		if err != nil {
 			return err
 		}
@@ -223,12 +239,20 @@ func (s *Server) refresh(ctx context.Context, w http.ResponseWriter, client core
 	issued(w, out, grant.Scope)
 }
 
-// issue stores a new access token (1 h) and refresh token (30 d) of grant g in family.
-func issue(ctx context.Context, o store.OAuthStore, g core.GrantID, family string, now time.Time) (tokenPair, error) {
-	p := tokenPair{access: randomToken(), refresh: randomToken(), family: family}
+// issue stores a new access token (1 h) and refresh token (30 d) of grant g in family. The access token ends at until
+// instead when that is sooner: the end of the person's term (nil: none). The refresh token keeps its 30 days: every
+// refresh checks the person again, so a term the owner extends keeps the connection.
+func issue(ctx context.Context, o store.OAuthStore, g core.GrantID, family string, now time.Time, until *time.Time,
+) (tokenPair, error) {
+	end := now.Add(accessTTL)
+	if until != nil {
+		end = earlier(end, *until)
+	}
+	p := tokenPair{
+		access: randomToken(), refresh: randomToken(), family: family, expiresIn: int64(end.Sub(now) / time.Second),
+	}
 	err := o.PutToken(ctx, core.Token{
-		Hash: hashOf(p.access), GrantID: g, Kind: core.TokenAccess, Family: family, CreatedAt: now,
-		ExpiresAt: now.Add(accessTTL),
+		Hash: hashOf(p.access), GrantID: g, Kind: core.TokenAccess, Family: family, CreatedAt: now, ExpiresAt: end,
 	})
 	if err != nil {
 		return tokenPair{}, err
@@ -247,9 +271,24 @@ func issue(ctx context.Context, o store.OAuthStore, g core.GrantID, family strin
 func issued(w http.ResponseWriter, p tokenPair, scope string) {
 	noStore(w)
 	writeJSON(w, http.StatusOK, tokenResponse{
-		AccessToken: p.access, TokenType: "Bearer", ExpiresIn: int64(accessTTL / time.Second),
-		RefreshToken: p.refresh, Scope: scope,
+		AccessToken: p.access, TokenType: "Bearer", ExpiresIn: p.expiresIn, RefreshToken: p.refresh, Scope: scope,
 	})
+}
+
+// activePerson returns the person of grant g when they may still use it at now: they exist, are in the grant's
+// account and are active (core.Person.Active: not disabled, and before the end of their term). Otherwise errGrant,
+// which the token endpoint answers invalid_grant; a store failure is itself.
+func (s *Server) activePerson(ctx context.Context, g core.Grant, now time.Time) (core.Person, error) {
+	p, err := s.store.People().Get(ctx, g.PersonID)
+	switch {
+	case errors.Is(err, core.ErrNotFound):
+		return core.Person{}, errGrant
+	case err != nil:
+		return core.Person{}, err
+	case p.AccountID != g.AccountID, !p.Active(now):
+		return core.Person{}, errGrant
+	}
+	return p, nil
 }
 
 // refreshReused handles a spent refresh token that came back: someone holds a stale copy, so its whole family is

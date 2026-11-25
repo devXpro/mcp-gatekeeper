@@ -102,6 +102,9 @@ func classify(err error) *APIError {
 	switch {
 	case errors.Is(err, ErrSelf):
 		return invalid("you cannot remove yourself")
+	case errors.Is(err, ErrWidens):
+		// updateMember retries behind step-up; this only answers a caller that did not.
+		return NewError(http.StatusForbidden, httpsec.CodeStepUp, "confirm with your passkey")
 	case errors.Is(err, ErrSuperadmin):
 		return NewError(http.StatusConflict, httpsec.CodeConflict, "a superadmin cannot be removed from an account")
 	case errors.Is(err, ErrInvalidName):

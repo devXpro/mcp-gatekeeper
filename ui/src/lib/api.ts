@@ -12,8 +12,15 @@ export class ApiError extends Error {
   /** why a 502 upstream failed, e.g. "not_deployed": the module is not installed but may hold the family's data */
   readonly reason?: string
   readonly retryAfter?: number
+  /** every other key of the error body besides "error" and "message" (an application's, e.g. fields, callId) */
+  readonly details: Record<string, unknown>
 
-  constructor(status: number, code: string, message: string, extra: { module?: string; reason?: string; retryAfter?: number } = {}) {
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    extra: { module?: string; reason?: string; retryAfter?: number; details?: Record<string, unknown> } = {},
+  ) {
     super(message)
     this.name = 'ApiError'
     this.status = status
@@ -21,6 +28,7 @@ export class ApiError extends Error {
     this.module = extra.module
     this.reason = extra.reason
     this.retryAfter = extra.retryAfter
+    this.details = extra.details ?? {}
   }
 }
 
@@ -197,12 +205,17 @@ export async function request<T>(method: Method, path: string, body?: unknown, o
   }
   connectivity.reportOnline()
   const data = (await res.json().catch(() => null)) as { error?: unknown; message?: unknown; module?: unknown; reason?: unknown } | null
+  const details: Record<string, unknown> = {}
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    for (const [k, v] of Object.entries(data)) if (k !== 'error' && k !== 'message') details[k] = v
+  }
   const code = typeof data?.error === 'string' && data.error ? data.error : 'generic'
   const retry = Number(res.headers.get('Retry-After'))
   const err = new ApiError(res.status, code, typeof data?.message === 'string' ? data.message : res.statusText, {
     module: typeof data?.module === 'string' ? data.module : undefined,
     reason: typeof data?.reason === 'string' ? data.reason : undefined,
     retryAfter: Number.isFinite(retry) && retry > 0 ? retry : undefined,
+    details,
   })
   if (err.code === 'no_session') {
     for (const l of noSessionListeners) l()

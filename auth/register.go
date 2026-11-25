@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 
 	"github.com/devXpro/mcp-gatekeeper/core"
+	"github.com/devXpro/mcp-gatekeeper/store"
 )
 
 // beginJSON answers every begin: the WebAuthn options in their JSON form, exactly the
@@ -45,10 +47,13 @@ type tokenInfoJSON struct {
 	Kind        core.InviteKind `json:"kind"`
 	Name        string          `json:"name"`
 	AccountName string          `json:"account_name,omitempty"`
+	CoOwner     bool            `json:"co_owner,omitempty"`
 }
 
 // tokenInfo says what a setup link or invite is: its kind, the name to show (the inviter's spelling, or the
-// superadmin's after reset-access) and the account it joins. 404 when it is not usable.
+// superadmin's after reset-access) and the account it joins. co_owner is true for an owner invite to an account that
+// has an owner already: the join page then does not ask for the account's name, which only the first owner sets.
+// 404 when it is not usable.
 func (a *Auth) tokenInfo(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Token string `json:"token"`
@@ -90,6 +95,10 @@ func (a *Auth) tokenInfo(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out.AccountName = acc.Name
+		if out.CoOwner, err = coOwnerInvite(ctx, a.st, inv.Kind, acc.ID); err != nil {
+			a.fail(w, r, err)
+			return
+		}
 	default:
 		a.fail(w, r, errToken)
 		return
@@ -114,7 +123,8 @@ type registration struct {
 
 // registerBegin starts a passkey registration with a setup link or an invite. name is the person's name: required for
 // the first setup, otherwise it defaults to the invite's. account_name names the first account, and renames the
-// account for an owner invite or a later setup link; a member invite ignores it.
+// account for an owner invite or a later setup link; a member invite ignores it, and so does an owner invite to an
+// account that has an owner already (a co-owner joins it as it is named).
 func (a *Auth) registerBegin(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Token       string `json:"token"`
@@ -275,7 +285,7 @@ func (a *Auth) registerFinish(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return err
 		}
-		if inv.ID != reg.inviteID || inv.Kind != reg.kind {
+		if inv.ID != reg.inviteID || inv.Kind != reg.kind || termEnded(inv, now) {
 			return errToken
 		}
 		if _, err := a.st.Passkeys().GetByCredentialID(ctx, cred.ID); err == nil {
@@ -283,7 +293,7 @@ func (a *Auth) registerFinish(w http.ResponseWriter, r *http.Request) {
 		} else if !errors.Is(err, core.ErrNotFound) {
 			return err
 		}
-		if person, account, err = a.applyRegistration(ctx, reg, now); err != nil {
+		if person, account, err = a.applyRegistration(ctx, reg, inv, now); err != nil {
 			return err
 		}
 		used := now
@@ -321,8 +331,9 @@ func (a *Auth) registerFinish(w http.ResponseWriter, r *http.Request) {
 
 // applyRegistration creates or updates the person and account of a registration, inside its transaction (ctx carries
 // it): the first account and its superadmin owner, the superadmin again after reset-access, or a new person of an
-// invite's account.
-func (a *Auth) applyRegistration(ctx context.Context, reg *registration, now time.Time) (core.Person, core.Account, error) {
+// invite's account. inv is the invite the transaction consumed: a member gets its term and permissions.
+func (a *Auth) applyRegistration(ctx context.Context, reg *registration, inv core.Invite,
+	now time.Time) (core.Person, core.Account, error) {
 	st := a.st
 	switch {
 	case reg.newAccount:
@@ -331,7 +342,7 @@ func (a *Auth) applyRegistration(ctx context.Context, reg *registration, now tim
 			return core.Person{}, core.Account{}, err
 		}
 		if n > 0 {
-			return core.Person{}, core.Account{}, errSuperadminExists
+			return core.Person{}, core.Account{}, a.errSuperadminExists()
 		}
 		acc := core.Account{ID: reg.account, Name: reg.accountName, CreatedAt: now}
 		if err := st.Accounts().Create(ctx, acc); err != nil {
@@ -382,19 +393,43 @@ func (a *Auth) applyRegistration(ctx context.Context, reg *registration, now tim
 	if err != nil {
 		return core.Person{}, core.Account{}, err
 	}
-	if reg.accountName != "" && reg.accountName != acc.Name {
+	rename := reg.accountName != "" && reg.accountName != acc.Name
+	if rename {
+		// A co-owner joins the account as it is named: only the first owner names it.
+		co, err := coOwnerInvite(ctx, st, reg.kind, acc.ID)
+		if err != nil {
+			return core.Person{}, core.Account{}, err
+		}
+		rename = !co
+	}
+	if rename {
 		if err := st.Accounts().Rename(ctx, acc.ID, reg.accountName); err != nil {
 			return core.Person{}, core.Account{}, err
 		}
 		acc.Name = reg.accountName
 	}
-	role := core.RoleMember
+	p := core.Person{ID: reg.person, AccountID: acc.ID, Name: reg.personName, Role: core.RoleMember, CreatedAt: now}
 	if reg.kind == core.InviteOwner {
-		role = core.RoleOwner
+		p.Role = core.RoleOwner
+	} else {
+		p.AccessUntil, p.Permissions = inv.AccessUntil, slices.Clone(inv.Permissions)
 	}
-	p := core.Person{ID: reg.person, AccountID: acc.ID, Name: reg.personName, Role: role, CreatedAt: now}
 	if err := st.People().Create(ctx, p); err != nil {
 		return core.Person{}, core.Account{}, err
 	}
 	return p, acc, nil
+}
+
+// coOwnerInvite reports whether an invite of kind to account a makes a co-owner: an owner invite to an account that
+// has an owner already. /api/auth/token says so (co_owner) and registration then leaves the account's name alone, both
+// by this one rule; ctx may carry the caller's transaction.
+func coOwnerInvite(ctx context.Context, st store.Store, kind core.InviteKind, a core.AccountID) (bool, error) {
+	if kind != core.InviteOwner {
+		return false, nil
+	}
+	people, err := st.People().ListByAccount(ctx, a)
+	if err != nil {
+		return false, err
+	}
+	return slices.ContainsFunc(people, func(p core.Person) bool { return p.Role == core.RoleOwner }), nil
 }

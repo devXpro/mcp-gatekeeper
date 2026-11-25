@@ -160,6 +160,10 @@ func (s *Server) checkRequest(ctx context.Context, q url.Values) (txn, error) {
 // target is the resource an authorization request is for: the one its resource parameter names, which must be
 // exactly the resource URL of a resource that can be connected, or, without one, the one a scope mcp:<id> names. A
 // present resource decides, and a scope naming another resource next to it is refused.
+//
+// The id of a scope goes through Paths both ways, as the resource of a resource parameter does (review GK-7): with
+// core.SingleResource every id has the one path, and only the resource's own id comes back from it, so the scope
+// mcp:<another id> cannot get a grant whose resource URL is the single resource's.
 func (s *Server) target(ctx context.Context, resources []string, scope requestedScope) (core.ResourceID, error) {
 	switch {
 	case len(resources) > 1:
@@ -167,24 +171,25 @@ func (s *Server) target(ctx context.Context, resources []string, scope requested
 	case len(resources) == 1:
 		id, ok := s.resourceOf(resources[0])
 		if !ok {
-			return "", authErr("invalid_target", "the resource is not a module of this hub")
+			return "", authErr("invalid_target", "the resource is not a "+s.noun+" of this "+s.app)
 		}
 		for _, named := range scope.resources {
 			if named != string(id) {
-				return "", authErr("invalid_scope", "the scope names another module than the resource")
+				return "", authErr("invalid_scope", "the scope names another "+s.noun+" than the resource")
 			}
 		}
 		return s.connectable(ctx, id, "invalid_target")
 	case len(scope.resources) == 0:
 		return "", authErr("invalid_target", "resource is required")
 	case len(scope.resources) > 1:
-		return "", authErr("invalid_scope", "the scope names more than one module")
+		return "", authErr("invalid_scope", "the scope names more than one "+s.noun)
 	}
-	id := scope.resources[0]
-	if !resourceIDPattern.MatchString(id) {
-		return "", authErr("invalid_scope", "the scope names no module of this hub")
+	named := scope.resources[0]
+	id, ok := s.resourceAt(s.paths.Path(core.ResourceID(named)))
+	if !ok || string(id) != named {
+		return "", authErr("invalid_scope", "the scope names no "+s.noun+" of this "+s.app)
 	}
-	return s.connectable(ctx, core.ResourceID(id), "invalid_scope")
+	return s.connectable(ctx, id, "invalid_scope")
 }
 
 // connectable returns resource id when it can be connected now; otherwise the error code, which says how the request
@@ -193,7 +198,7 @@ func (s *Server) connectable(ctx context.Context, id core.ResourceID, code strin
 	_, err := s.liveResource(ctx, id)
 	switch {
 	case errors.Is(err, errNoResource):
-		return "", authErr(code, "no such module is running")
+		return "", authErr(code, "no such "+s.noun+" is running")
 	case err != nil:
 		return "", err
 	}
@@ -266,7 +271,7 @@ func (s *Server) clientPage(w http.ResponseWriter, err error) {
 	case errors.Is(err, errMetadataFetch):
 		s.page(w, http.StatusBadGateway, pageMetadataFetch)
 	case errors.Is(err, errMetadataInvalid):
-		s.page(w, http.StatusBadRequest, pageMetadataInvalid)
+		s.page(w, http.StatusBadRequest, s.badDoc)
 	default:
 		s.log.Error("oauth: authorize failed", slog.Any("error", err))
 		s.page(w, http.StatusInternalServerError, pageServerError)
@@ -279,7 +284,7 @@ func (s *Server) authFail(w http.ResponseWriter, redirectURI, state string, err 
 	var ae *authError
 	if !errors.As(err, &ae) {
 		s.log.Error("oauth: authorize failed", slog.Any("error", err))
-		ae = &authError{code: "server_error", description: "the hub failed; try again"}
+		ae = &authError{code: "server_error", description: "the " + s.app + " failed; try again"}
 	}
 	noStore(w)
 	w.Header().Set("Location", s.responseURL(redirectURI, state, url.Values{

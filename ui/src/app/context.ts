@@ -3,7 +3,7 @@
 
 import type { LucideIcon } from 'lucide-react'
 import { createContext, useContext, type ComponentType, type ReactNode } from 'react'
-import type { Account, Me } from '../lib/types'
+import type { Account, Me, PermissionInfo } from '../lib/types'
 
 /** A tab of the shell (DESIGN.md §2.1): the tab bar on phones, the sidebar on desktop. */
 export interface TabDef {
@@ -14,6 +14,17 @@ export interface TabDef {
   label: string
   /** shown to the superadmin only */
   superadmin?: boolean
+  /** shown to owners only (the superadmin is an owner too) */
+  owner?: boolean
+  /** decided from the viewer, after superadmin and owner: false hides the tab */
+  visible?: (me: Me) => boolean
+}
+
+/** tabVisible: whether the viewer sees tab t (superadmin, owner, then the application's own rule). */
+export function tabVisible(t: TabDef, me: Me): boolean {
+  if (t.superadmin && !me.person.superadmin) return false
+  if (t.owner && me.person.role !== 'owner') return false
+  return t.visible ? t.visible(me) : true
 }
 
 /** A resource behind an MCP endpoint, as the connect page shows it (Family Hub: an AccountModule). */
@@ -64,7 +75,20 @@ export interface AppSlots {
   connect: ConnectSlots
   /** where "Get started" leads after the first-run setup link (Family Hub: "/admin") */
   setupDoneTo: string
+  /** the application gave a permission catalog: invites and the member detail offer access and a term */
+  access: boolean
+  /** the catalog, called as a hook; undefined while it loads (a no-op without a catalog) */
+  usePermissions: () => PermissionInfo[] | undefined
+  /** how the application's own data hooks stay live: server-sent events, or polling where SSE cannot pass */
+  live: LiveMode
+  /** the application's layer over every signed-in page, mounted once by the shell (null without one) */
+  Overlay: ComponentType<{ me: Me }> | null
+  /** called as a hook on the people list: a text means invites are off, and it stands in place of the invite button */
+  useInvitesDisabled: () => string | null | undefined
 }
+
+/** LiveMode: 'sse' (EventSource) or 'poll' (long-polling, e.g. behind a Cloudflare quick tunnel). */
+export type LiveMode = 'sse' | 'poll'
 
 export const AppContext = createContext<AppSlots | null>(null)
 
@@ -72,4 +96,9 @@ export function useApp(): AppSlots {
   const ctx = useContext(AppContext)
   if (!ctx) throw new Error('@devxpro/mcp-gatekeeper-ui: render the screens inside <GatekeeperApp> or <AppProvider>')
   return ctx
+}
+
+/** useLiveMode is the `live` option of GatekeeperApp: how the application's own data hooks follow changes. */
+export function useLiveMode(): LiveMode {
+  return useApp().live
 }

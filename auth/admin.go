@@ -52,9 +52,10 @@ func checkSteps(steps []ResetStep) error {
 //	              Refused while an enabled superadmin has a passkey.
 //	reset-access  wipes every passkey and session of the superadmin, revokes their OAuth grants, runs the
 //	              application's ResetSteps (Family Hub: deletes their legacy keys) and revokes the invites they made,
-//	              revokes the older setup links and prints a new one.
+//	              revokes the older setup links and prints a new one; then Options.OnAccessReset hears of it.
 //
-// The links are printed to the operator's terminal only, never logged.
+// The links are printed to the operator's terminal only, never logged. Both commands audit the socket's peer (its pid
+// and executable, and who started it: adminsock.Peer) when the socket knew it.
 func (a *Auth) AdminCommands() []adminsock.Command {
 	return []adminsock.Command{
 		{Name: "setup-link", Summary: "print a one-time link that registers the superadmin's passkey", Run: a.cmdSetupLink},
@@ -74,22 +75,37 @@ func (a *Auth) cmdSetupLink(ctx context.Context, inv adminsock.Invocation) error
 	if err := noArgs("setup-link", inv); err != nil {
 		return err
 	}
-	now := a.now()
-	var (
-		url     string
-		expires time.Time
-	)
-	err := a.st.Tx(ctx, func(ctx context.Context) error {
-		var err error
-		url, expires, err = a.newSetupLink(ctx, now)
-		return err
-	})
+	detail, attrs := peerDetail(inv.Peer)
+	url, expires, err := a.issueSetupLink(ctx, SetupLinkTTL, "on the admin socket", detail, attrs)
 	if err != nil {
 		return err
 	}
-	a.audit(ctx, core.AuditEntry{At: now, Action: "admin.setup-link", Detail: map[string]string{"expires_at": rfc3339(expires)}})
-	a.log.Info("auth: a setup link was made on the admin socket", slog.Time("expires", expires))
-	return printLink(inv.Out, url, expires)
+	return a.printLink(inv.Out, url, expires)
+}
+
+// peerDetail is the socket peer for an audit entry's detail (peer_pid, peer_exe and, when known, peer_chain) and a log
+// line, when the socket knew it (review GK-5: on a desktop every program of the same user reaches the socket, so the
+// audit names which one; the peer is usually the application's own CLI, so peer_chain names who started it).
+func peerDetail(p adminsock.Peer) (map[string]string, []any) {
+	if p.PID <= 0 {
+		return map[string]string{}, nil
+	}
+	detail := map[string]string{"peer_pid": strconv.Itoa(p.PID), "peer_exe": p.Exe}
+	attrs := []any{slog.Int("peer_pid", p.PID), slog.String("peer_exe", p.Exe)}
+	if p.Chain != "" {
+		detail["peer_chain"] = p.Chain
+		attrs = append(attrs, slog.String("peer_chain", p.Chain))
+	}
+	return detail, attrs
+}
+
+// AccessReset is what Options.OnAccessReset learns after reset-access: when, whose access was wiped (the
+// superadmins; empty on an application nobody has set up), and the socket peer that asked (adminsock.Peer: its pid,
+// executable and ancestors, when known).
+type AccessReset struct {
+	At     time.Time
+	People []core.PersonID
+	Peer   adminsock.Peer
 }
 
 func (a *Auth) cmdResetAccess(ctx context.Context, inv adminsock.Invocation) error {
@@ -116,24 +132,32 @@ func (a *Auth) cmdResetAccess(ctx context.Context, inv adminsock.Invocation) err
 			}
 			people, total = append(people, p), total.add(n)
 		}
-		url, expires, err = a.newSetupLink(ctx, now)
+		url, expires, err = a.newSetupLink(ctx, now, SetupLinkTTL)
 		return err
 	})
 	if err != nil {
 		return err
 	}
-	detail := map[string]string{"people": strconv.Itoa(len(people)), "passkeys": strconv.Itoa(total.passkeys),
-		"grants": strconv.Itoa(total.grants), "invites": strconv.Itoa(total.invites)}
+	detail, peerAttrs := peerDetail(inv.Peer)
+	detail["people"], detail["passkeys"] = strconv.Itoa(len(people)), strconv.Itoa(total.passkeys)
+	detail["grants"], detail["invites"] = strconv.Itoa(total.grants), strconv.Itoa(total.invites)
 	attrs := []any{slog.Int("people", len(people)), slog.Int("passkeys", total.passkeys), slog.Int("grants", total.grants)}
 	for i, s := range a.steps {
 		detail[s.Key] = strconv.Itoa(total.steps[i])
 		attrs = append(attrs, slog.Int(s.Key, total.steps[i]))
 	}
-	attrs = append(attrs, slog.Int("invites", total.invites))
+	attrs = append(append(attrs, slog.Int("invites", total.invites)), peerAttrs...)
 	a.audit(ctx, core.AuditEntry{At: now, Action: "admin.reset-access", Detail: detail})
 	a.log.Info("auth: access was reset on the admin socket", attrs...)
+	if a.onReset != nil {
+		ids := make([]core.PersonID, 0, len(people))
+		for _, p := range people {
+			ids = append(ids, p.ID)
+		}
+		a.onReset(context.WithoutCancel(ctx), AccessReset{At: now, People: ids, Peer: inv.Peer})
+	}
 	if len(people) == 0 {
-		if _, err := fmt.Fprintln(inv.Out, "The hub has no superadmin yet: nothing to wipe."); err != nil {
+		if _, err := fmt.Fprintf(inv.Out, "The %s has no superadmin yet: nothing to wipe.\n", a.brand.AppWord()); err != nil {
 			return err
 		}
 	}
@@ -147,7 +171,7 @@ func (a *Auth) cmdResetAccess(ctx context.Context, inv adminsock.Invocation) err
 			return err
 		}
 	}
-	return printLink(inv.Out, url, expires)
+	return a.printLink(inv.Out, url, expires)
 }
 
 // summary lists what reset-access ended: "1 passkeys, 0 connectors (OAuth grants), 2 legacy keys and 0 open invites".
@@ -237,9 +261,9 @@ func (a *Auth) resetPerson(ctx context.Context, p core.Person, now time.Time) (r
 	return n, nil
 }
 
-func printLink(w io.Writer, url string, expires time.Time) error {
+func (a *Auth) printLink(w io.Writer, url string, expires time.Time) error {
 	_, err := fmt.Fprintf(w, "The setup link works once, until %s (%s):\n\n  %s\n\n"+
-		"Open it on the device that should hold the superadmin's passkey. Whoever opens it first takes the hub:\n"+
-		"do not share it.\n", rfc3339(expires), SetupLinkTTL, url)
+		"Open it on the device that should hold the superadmin's passkey. Whoever opens it first takes the %s:\n"+
+		"do not share it.\n", rfc3339(expires), SetupLinkTTL, url, a.brand.AppWord())
 	return err
 }

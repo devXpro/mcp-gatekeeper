@@ -13,25 +13,57 @@ import (
 )
 
 const (
-	// inFlightPerResource is how many calls of one account may be inside one resource at once, open event streams
-	// included: one family's runaway assistant must not take a resource every family shares.
+	// inFlightPerResource is the default of Options.InFlightPerResource: how many calls of one account may be inside
+	// one resource at once, open event streams included: one family's runaway assistant must not take a resource
+	// every family shares.
 	inFlightPerResource = 16
-	// failuresPerAddress is how many unknown credentials one client address may present a minute.
+	// failuresPerAddress is the default of Options.FailuresPerAddress: how many unknown credentials one client address
+	// may present a minute.
 	failuresPerAddress = 30
 	// maxFailureBuckets bounds the failure limiter's memory under a flood of addresses.
 	maxFailureBuckets = 4096
 )
 
-// Admit takes a place for a call of account a in resource id among the 16 calls that may be inside it at once, or
-// answers 429 with Retry-After. The caller gives the place back with release when the call ends (a second release
-// does nothing). Every door into the same resource admits its calls here (Family Hub: its legacy REST door too), so
-// that they share the places.
+// InFlightKey says who holds the in-flight places of a resource (Options.InFlightKey).
+type InFlightKey int
+
+// Holders of in-flight places.
+const (
+	// PerAccount: every person of an account shares the places (Family Hub, where many families share each
+	// resource).
+	PerAccount InFlightKey = iota
+	// PerPerson: each person has their own places (Homie, where one account is the whole household, guests included,
+	// and one person's open event streams must not lock everyone else out).
+	PerPerson
+)
+
+// Admit takes a place for a call of account a in resource id among the Options.InFlightPerResource calls that may be
+// inside it at once, or answers 429 with Retry-After. The caller gives the place back with release when the call
+// ends (a second release does nothing). Every door into the same resource admits its calls here (Family Hub: its
+// legacy REST door too), so that they share the places.
+//
+// Admit counts by account whatever Options.InFlightKey says; a door that knows its caller uses AdmitAccess, which
+// follows it. An application with PerPerson admits every door through AdmitAccess, so that they share the places.
 func (g *Guard) Admit(w http.ResponseWriter, a core.AccountID, id core.ResourceID) (release func(), ok bool) {
-	if !g.inFlight.acquire(a, id) {
-		tooMany(w, time.Second, "too many calls to this module at once; try again shortly")
+	return g.admit(w, placeKey{account: a, resource: id})
+}
+
+// AdmitAccess is Admit for the caller the middleware let through (AccessFrom): it takes a place in info.ResourceID
+// for info's account, or for info's person under PerPerson.
+func (g *Guard) AdmitAccess(w http.ResponseWriter, info core.AccessInfo) (release func(), ok bool) {
+	k := placeKey{account: info.AccountID, resource: info.ResourceID}
+	if g.perPerson {
+		k.person = info.PersonID
+	}
+	return g.admit(w, k)
+}
+
+func (g *Guard) admit(w http.ResponseWriter, k placeKey) (release func(), ok bool) {
+	if !g.inFlight.acquire(k) {
+		tooMany(w, time.Second, "too many calls to this "+g.noun+" at once; try again shortly")
 		return nil, false
 	}
-	return sync.OnceFunc(func() { g.inFlight.release(a, id) }), true
+	return sync.OnceFunc(func() { g.inFlight.release(k) }), true
 }
 
 // failureLimit counts the unknown credentials each client address presents, in a token bucket per address that
@@ -106,27 +138,29 @@ func addressKey(addr string) string {
 	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
 }
 
-// inFlight counts the calls inside each (account, resource).
+// inFlight counts the calls inside each (holder, resource).
 type inFlight struct {
 	limit int
 
 	mu    sync.Mutex
-	calls map[inFlightKey]int
+	calls map[placeKey]int
 }
 
-type inFlightKey struct {
+// placeKey is a holder of places in a resource: an account, or a person of it (PerPerson; person is empty
+// otherwise).
+type placeKey struct {
 	account  core.AccountID
+	person   core.PersonID
 	resource core.ResourceID
 }
 
-func newInFlight(limit int) *inFlight { return &inFlight{limit: limit, calls: map[inFlightKey]int{}} }
+func newInFlight(limit int) *inFlight { return &inFlight{limit: limit, calls: map[placeKey]int{}} }
 
-// acquire takes a place for a call of account a in resource id; the caller gives it back with release. It reports
-// false when all places are taken.
-func (f *inFlight) acquire(a core.AccountID, id core.ResourceID) bool {
+// acquire takes a place for a call of k; the caller gives it back with release. It reports false when all places are
+// taken.
+func (f *inFlight) acquire(k placeKey) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	k := inFlightKey{a, id}
 	if f.calls[k] >= f.limit {
 		return false
 	}
@@ -134,10 +168,9 @@ func (f *inFlight) acquire(a core.AccountID, id core.ResourceID) bool {
 	return true
 }
 
-func (f *inFlight) release(a core.AccountID, id core.ResourceID) {
+func (f *inFlight) release(k placeKey) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	k := inFlightKey{a, id}
 	if f.calls[k] <= 1 {
 		delete(f.calls, k)
 		return

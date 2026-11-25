@@ -41,6 +41,11 @@ func invalid(format string, args ...any) *apiError {
 	return newError(http.StatusBadRequest, httpsec.CodeInvalid, fmt.Sprintf(format, args...))
 }
 
+// CodeAccessEnded is the error code of a sign-in whose passkey verified but whose person's term has ended
+// (core.Person.AccessUntil), answered 403: the UI tells them to ask the owner to extend it. It is its own code, not
+// forbidden, which a CSRF refusal answers too.
+const CodeAccessEnded = "access_ended"
+
 // The answers auth gives, by error code.
 var (
 	errNoSession = &apiError{status: http.StatusUnauthorized, code: httpsec.CodeNoSession, message: "sign in first",
@@ -61,12 +66,8 @@ var (
 		message: "this passkey is already registered", cause: core.ErrConflict}
 	errLastPasskey = &apiError{status: http.StatusConflict, code: httpsec.CodeConflict,
 		message: "this is your last passkey; add another one first", cause: core.ErrConflict}
-	errNoPasskey = &apiError{status: http.StatusConflict, code: httpsec.CodeConflict,
-		message: "you have no passkey of this hub to confirm with", cause: core.ErrConflict}
-	errSuperadminExists = &apiError{status: http.StatusConflict, code: httpsec.CodeConflict,
-		message: "the hub already has a superadmin", cause: core.ErrConflict}
-	errSuperadminDisabled = &apiError{status: http.StatusConflict, code: httpsec.CodeConflict,
-		message: "every superadmin of the hub is disabled", cause: core.ErrConflict}
+	errAccessEnded = &apiError{status: http.StatusForbidden, code: CodeAccessEnded,
+		message: "your access has ended; ask the owner to extend it", cause: core.ErrForbidden}
 	errBusy = newError(http.StatusTooManyRequests, httpsec.CodeRateLimited,
 		"too many passkey ceremonies are in progress; try again in a minute")
 	errInternal = newError(http.StatusInternalServerError, httpsec.CodeInternal, "internal error")
@@ -77,6 +78,26 @@ var (
 func (a *Auth) errSuperadminHasPasskey() *apiError {
 	return &apiError{status: http.StatusConflict, code: httpsec.CodeConflict,
 		message: "the superadmin already has a passkey; `" + a.adminCLI + " reset-access` replaces it", cause: core.ErrConflict}
+}
+
+// The answers below name the application by Brand.AppWord (review GK-18): Family Hub's "hub" by default.
+
+// errNoPasskey refuses a step-up of a person without a usable passkey.
+func (a *Auth) errNoPasskey() *apiError {
+	return &apiError{status: http.StatusConflict, code: httpsec.CodeConflict,
+		message: "you have no passkey of this " + a.brand.AppWord() + " to confirm with", cause: core.ErrConflict}
+}
+
+// errSuperadminExists refuses a first setup when a superadmin appeared meanwhile.
+func (a *Auth) errSuperadminExists() *apiError {
+	return &apiError{status: http.StatusConflict, code: httpsec.CodeConflict,
+		message: "the " + a.brand.AppWord() + " already has a superadmin", cause: core.ErrConflict}
+}
+
+// errSuperadminDisabled refuses a setup link while no superadmin is active.
+func (a *Auth) errSuperadminDisabled() *apiError {
+	return &apiError{status: http.StatusConflict, code: httpsec.CodeConflict,
+		message: "every superadmin of the " + a.brand.AppWord() + " is disabled", cause: core.ErrConflict}
 }
 
 // reqState is what guard needs to learn from the handler after it ran: whether a finish's passkey or ceremony did

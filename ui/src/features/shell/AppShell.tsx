@@ -4,12 +4,13 @@ import { AnimatePresence, motion } from 'motion/react'
 import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Navigate, ScrollRestoration, useLocation, useMatches, useNavigate, useNavigationType, useOutlet } from 'react-router'
-import { useApp } from '../../app/context'
+import { tabVisible, useApp } from '../../app/context'
 import { Page } from '../../components/page'
 import { Button, ButtonLink } from '../../components/ui/button'
 import { EmptyState, ErrorState } from '../../components/ui/feedback'
 import { StepUpProvider } from '../auth/stepup'
 import { api, connectivity, isApiError, isOffline, onNoSession } from '../../lib/api'
+import { errorText } from '../../lib/errors'
 import { fade, spring, type Direction } from '../../lib/motion'
 import { useAccount, useMe } from '../../lib/queries'
 import { toast } from '../../lib/toast'
@@ -85,7 +86,8 @@ export function AppShell() {
     if (isOffline(me.error)) return <OfflineScreen onRetry={() => void me.refetch()} />
     return (
       <main className="flex min-h-dvh items-center justify-center">
-        <ErrorState onRetry={() => void me.refetch()} />
+        {/* Words for the code (error.<code>, e.g. an application's error.misdirected), the generic text otherwise. */}
+        <ErrorState text={errorText(me.error, t)} onRetry={() => void me.refetch()} />
       </main>
     )
   }
@@ -131,7 +133,8 @@ function Frame({ me }: { me: Me }) {
   // The application's badges (Family Hub: a service that needs the owner, a module that failed).
   const badges = app.useBadges(me)
   const tab = handle?.tab
-  const tabs = app.tabs.filter((x) => !x.superadmin || me.person.superadmin)
+  const tabs = app.tabs.filter((x) => tabVisible(x, me))
+  const Overlay = app.Overlay
 
   useEffect(() => {
     recordNavigation(navType, location.key, location.pathname)
@@ -159,6 +162,7 @@ function Frame({ me }: { me: Me }) {
         <AnimatedOutlet />
       </div>
       <TabBar tabs={tabs} current={tab} badges={badges} />
+      {Overlay && <Overlay me={me} />}
       <ScrollRestoration
         getKey={(loc, matches) => {
           const h = matches[matches.length - 1]?.handle as PageHandle | undefined

@@ -13,8 +13,9 @@ import (
 )
 
 // Viewer returns the signed-in person of r, or core.ErrNoSession; other errors are store failures. It owns the
-// expiry rules: a session past its absolute end or idle for 12 hours, or whose person is gone or disabled, or whose
-// account is gone, is deleted. LastSeenAt is written at most once a minute.
+// expiry rules: a session past its absolute end or idle for 12 hours, or whose person is gone or not active
+// (core.Person.Active: disabled, or past the end of their term), or whose account is gone, is deleted. LastSeenAt is
+// written at most once a minute.
 func (a *Auth) Viewer(r *http.Request) (core.Viewer, error) {
 	ck, err := r.Cookie(a.brand.SessionCookie)
 	if err != nil || !wellFormedToken(ck.Value) {
@@ -39,7 +40,7 @@ func (a *Auth) Viewer(r *http.Request) (core.Viewer, error) {
 		return core.Viewer{}, core.ErrNoSession
 	}
 	person, err := a.st.People().Get(ctx, s.PersonID)
-	if err == nil && person.DisabledAt != nil {
+	if err == nil && !person.Active(now) {
 		err = core.ErrNotFound
 	}
 	if errors.Is(err, core.ErrNotFound) {

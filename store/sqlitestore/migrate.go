@@ -151,6 +151,16 @@ CREATE TABLE gk_audit (
 ) STRICT;
 CREATE INDEX gk_audit_account ON gk_audit (account_id, id);
 `},
+	{Version: 2, Name: "access term and permissions", SQL: `
+-- A person's end of access and the application's permission ids (a JSON array; NULL is none), and the same on an
+-- invite, which copies them to the person who redeems it.
+ALTER TABLE gk_people ADD COLUMN access_until INTEGER;
+ALTER TABLE gk_people ADD COLUMN permissions TEXT;
+ALTER TABLE gk_invites ADD COLUMN access_until INTEGER;
+ALTER TABLE gk_invites ADD COLUMN permissions TEXT;
+-- Purge deletes the audit by age.
+CREATE INDEX gk_audit_at ON gk_audit (at);
+`},
 }
 
 // validateMigrations checks an application's list.

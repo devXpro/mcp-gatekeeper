@@ -82,10 +82,23 @@ func (s *Service) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /api/account/connections", view(s.listConnections))
 	mux.Handle("DELETE /api/account/connections/{id}", view(s.revokeConnection))
 	mux.Handle("GET /api/account/audit", view(s.accountAudit))
+	if s.o.Permissions != nil {
+		// Step-up only when the change widens access: updateMember asks for it then.
+		mux.Handle("PATCH /api/account/members/{id}", view(s.updateMember, owner))
+		mux.Handle("GET /api/account/permissions", view(s.listPermissions, owner))
+	}
 
 	mux.Handle("GET /api/admin/accounts", view(s.listAccounts, super))
-	mux.Handle("POST /api/admin/accounts", view(s.createAccount, super, step))
-	mux.Handle("DELETE /api/admin/accounts/{id}", view(s.adminDeleteAccount, super, step))
+	if s.o.SingleAccount {
+		gone := NoStore(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeError(w, NewError(http.StatusNotFound, httpsec.CodeNotFound, "not found"))
+		}))
+		mux.Handle("POST /api/admin/accounts", gone)
+		mux.Handle("DELETE /api/admin/accounts/{id}", gone)
+	} else {
+		mux.Handle("POST /api/admin/accounts", view(s.createAccount, super, step))
+		mux.Handle("DELETE /api/admin/accounts/{id}", view(s.adminDeleteAccount, super, step))
+	}
 	mux.Handle("GET /api/admin/audit", view(s.systemAudit, super))
 }
 
@@ -126,12 +139,63 @@ type memberJSON struct {
 	Role     core.Role     `json:"role"`
 	JoinedAt string        `json:"joined_at"`
 	You      bool          `json:"you"`
+
+	// Only with Options.Permissions (without it the answer keeps its old bytes), and only to an owner or on the
+	// viewer's own row (memberRow).
+	*memberAccessJSON
+}
+
+// memberAccessJSON is a member's term and permissions: access_until is null for no end, permissions is ["all"] for
+// an owner, and active is false once the term has ended (or the person is disabled).
+type memberAccessJSON struct {
+	AccessUntil *string  `json:"access_until"`
+	Permissions []string `json:"permissions"`
+	Active      bool     `json:"active"`
 }
 
 type inviteJSON struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	ExpiresAt string `json:"expires_at"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	ExpiresAt string    `json:"expires_at"`
+	Role      core.Role `json:"role,omitempty"` // only with Options.CoOwners
+
+	// Only with Options.Permissions.
+	*inviteAccessJSON
+}
+
+// inviteAccessJSON is the term and permissions an invite gives, as memberAccessJSON.
+type inviteAccessJSON struct {
+	AccessUntil *string  `json:"access_until"`
+	Permissions []string `json:"permissions"`
+}
+
+// memberRow is p as the listings show it to viewer v. The term, permissions and active show to an owner on every
+// row, and to anyone else on their own row only: a guest sees who is in the account, not the others' access.
+func (s *Service) memberRow(p core.Person, v core.Viewer) memberJSON {
+	you := p.ID == v.Person.ID
+	row := memberJSON{ID: p.ID, Name: p.Name, Role: p.Role, JoinedAt: rfc3339(p.CreatedAt), You: you}
+	if s.o.Permissions != nil && (you || v.Person.Role == core.RoleOwner) {
+		row.memberAccessJSON = &memberAccessJSON{AccessUntil: optTime(p.AccessUntil),
+			Permissions: effectivePermissions(p.Role, p.Permissions), Active: p.Active(s.now())}
+	}
+	return row
+}
+
+// inviteRow is inv as GET /api/account lists it.
+func (s *Service) inviteRow(inv core.Invite) inviteJSON {
+	row := inviteJSON{ID: inv.ID, Name: inv.Name, ExpiresAt: rfc3339(inv.ExpiresAt)}
+	role := core.RoleMember
+	if inv.Kind == core.InviteOwner {
+		role = core.RoleOwner
+	}
+	if s.o.CoOwners {
+		row.Role = role
+	}
+	if s.o.Permissions != nil {
+		row.inviteAccessJSON = &inviteAccessJSON{AccessUntil: optTime(inv.AccessUntil),
+			Permissions: effectivePermissions(role, inv.Permissions)}
+	}
+	return row
 }
 
 type accountJSON struct {
@@ -152,8 +216,7 @@ func (s *Service) getAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	out := accountJSON{ID: v.Account.ID, Name: v.Account.Name, Members: []memberJSON{}, Invites: []inviteJSON{}}
 	for _, p := range people {
-		out.Members = append(out.Members, memberJSON{ID: p.ID, Name: p.Name, Role: p.Role,
-			JoinedAt: rfc3339(p.CreatedAt), You: p.ID == v.Person.ID})
+		out.Members = append(out.Members, s.memberRow(p, v))
 	}
 	if v.Person.Role == core.RoleOwner {
 		invites, err := s.Invites(ctx, v.Account.ID)
@@ -162,7 +225,7 @@ func (s *Service) getAccount(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, inv := range invites {
-			out.Invites = append(out.Invites, inviteJSON{ID: inv.ID, Name: inv.Name, ExpiresAt: rfc3339(inv.ExpiresAt)})
+			out.Invites = append(out.Invites, s.inviteRow(inv))
 		}
 	}
 	var extra map[string]any
@@ -199,6 +262,20 @@ func (s *Service) deleteAccount(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, invalid("confirm must equal the account name"))
 		return
 	}
+	if s.o.CoOwners && !v.Person.Superadmin {
+		// Deleting the account removes its other owners too, which only the superadmin may do.
+		people, err := s.Members(r.Context(), v.Account.ID)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		if slices.ContainsFunc(people, func(p core.Person) bool {
+			return p.ID != v.Person.ID && (p.Role == core.RoleOwner || p.Superadmin)
+		}) {
+			s.fail(w, r, ErrSuperadminOnly)
+			return
+		}
+	}
 	if err := s.DeleteAccount(r.Context(), v.Account.ID, v.Person.ID, s.ip(r), "owner"); err != nil {
 		s.fail(w, r, err)
 		return
@@ -209,26 +286,54 @@ func (s *Service) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	writeRaw(w, []byte("{}"))
 }
 
-type nameBody struct {
-	Name string `json:"name"`
-}
-
 type createdInviteJSON struct {
 	ID        string `json:"id"`
 	URL       string `json:"url"`
 	ExpiresAt string `json:"expires_at"`
 }
 
+// inviteBody is POST /api/account/invites: name, and with the options that offer them role ("member" or "owner"),
+// access_until (RFC 3339) and permissions (ids). A null is the same as leaving the field out.
+type inviteBody struct {
+	Name        string   `json:"name"`
+	Role        *string  `json:"role"`
+	AccessUntil *string  `json:"access_until"`
+	Permissions []string `json:"permissions"`
+}
+
 // createInvite is POST /api/account/invites (owner, step-up). The URL carries the token in its fragment; it is
 // answered once and never logged.
 func (s *Service) createInvite(w http.ResponseWriter, r *http.Request) {
 	v := viewer(r)
-	var body nameBody
+	var body inviteBody
 	if err := decode(w, r, &body); err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	inv, err := s.CreateInvite(r.Context(), v.Account.ID, body.Name, v.Person.ID, s.ip(r))
+	spec := InviteSpec{Name: body.Name, Permissions: body.Permissions}
+	if body.Role != nil {
+		if !s.o.CoOwners {
+			s.fail(w, r, errNoRole)
+			return
+		}
+		if spec.Role = core.Role(*body.Role); spec.Role == "" {
+			s.fail(w, r, errBadRole)
+			return
+		}
+	}
+	if body.AccessUntil != nil {
+		if s.o.Permissions == nil {
+			s.fail(w, r, errNoTerms)
+			return
+		}
+		until, err := parseUntil(*body.AccessUntil)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		spec.AccessUntil = &until
+	}
+	inv, err := s.Invite(r.Context(), v.Account.ID, spec, v.Person.ID, s.ip(r))
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -255,6 +360,98 @@ func (s *Service) removeMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	noContent(w)
+}
+
+// optional is a JSON field that may be left out (Set false), null (Set, Null) or a value.
+type optional[T any] struct {
+	Set, Null bool
+	Value     T
+}
+
+func (o *optional[T]) UnmarshalJSON(b []byte) error {
+	o.Set = true
+	if string(b) == "null" {
+		o.Null = true
+		return nil
+	}
+	return json.Unmarshal(b, &o.Value)
+}
+
+// memberPatchBody is PATCH /api/account/members/{id}: access_until is RFC 3339 or null (no end), permissions a list
+// of ids; a field left out stays as it is.
+type memberPatchBody struct {
+	AccessUntil optional[string]   `json:"access_until"`
+	Permissions optional[[]string] `json:"permissions"`
+}
+
+// updateMember is PATCH /api/account/members/{id} (owner; never yourself): change a member's term and permissions.
+// A change that widens their access (a later or no end, or a permission they lacked) also needs step-up, and is
+// answered as RequireStepUp answers without it; ending access ({"access_until": now}) or taking permissions away does
+// not. It answers the member as GET /api/account lists them.
+func (s *Service) updateMember(w http.ResponseWriter, r *http.Request) {
+	v := viewer(r)
+	var body memberPatchBody
+	if err := decode(w, r, &body); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	ch := AccessChange{SetUntil: body.AccessUntil.Set, SetPermissions: body.Permissions.Set,
+		Permissions: body.Permissions.Value}
+	if body.AccessUntil.Set && !body.AccessUntil.Null {
+		until, err := parseUntil(body.AccessUntil.Value)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		ch.Until = &until
+	}
+	if body.Permissions.Null {
+		s.fail(w, r, invalid("permissions must be a list"))
+		return
+	}
+	target := core.PersonID(r.PathValue("id"))
+	apply := func(w http.ResponseWriter, r *http.Request, confirmed bool) error {
+		p, err := s.UpdateMember(r.Context(), v.Account.ID, target, v.Person.ID, ch, confirmed, s.ip(r))
+		if err == nil {
+			s.writeJSON(w, r, s.memberRow(p, v))
+		}
+		return err
+	}
+	err := apply(w, r, false)
+	if errors.Is(err, ErrWidens) {
+		// Nothing changed; again behind step-up, which answers step_up_required when the session has none.
+		s.o.Sessions.RequireStepUp(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if err := apply(w, r, true); err != nil {
+				s.fail(w, r, err)
+			}
+		})).ServeHTTP(w, r)
+		return
+	}
+	if err != nil {
+		s.fail(w, r, err)
+	}
+}
+
+type permissionJSON struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	Group string `json:"group"`
+}
+
+// listPermissions is GET /api/account/permissions (owner; only with Options.Permissions): what the application offers
+// in the viewer's account, for the invite and member pickers. core.PermissionAll is always accepted besides these.
+func (s *Service) listPermissions(w http.ResponseWriter, r *http.Request) {
+	v := viewer(r)
+	list, err := s.o.Permissions.Permissions(r.Context(), v.Account.ID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	out := make([]permissionJSON, 0, len(list))
+	for _, p := range list {
+		out = append(out, permissionJSON{ID: p.ID, Title: p.Title, Group: p.Group})
+	}
+	s.writeJSON(w, r, out)
 }
 
 type connectionJSON struct {
@@ -355,6 +552,17 @@ func (s *Service) revokeConnection(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, NewError(http.StatusForbidden, httpsec.CodeForbidden,
 			"only the owner may revoke another person's connection"))
 		return
+	}
+	if s.o.CoOwners && g.PersonID != v.Person.ID {
+		// Another owner's connection is the superadmin's to revoke.
+		p, err := s.st.People().Get(ctx, g.PersonID)
+		if err == nil {
+			err = s.mayManage(ctx, v.Account.ID, v.Person.ID, p)
+		}
+		if err != nil && !errors.Is(err, core.ErrNotFound) {
+			s.fail(w, r, err)
+			return
+		}
 	}
 	if err := s.o.Revoker.RevokeGrant(ctx, g.ID, v.Person.ID, s.ip(r)); err != nil {
 		s.fail(w, r, err)

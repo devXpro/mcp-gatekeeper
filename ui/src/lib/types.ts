@@ -33,6 +33,8 @@ export interface TokenInfo {
   kind: InviteKind
   name: string
   account_name?: string
+  /** an owner invite into an account that has an owner already: the person joins it as a co-owner */
+  co_owner?: boolean
 }
 
 /** The answer of every passkey "begin" call: WebAuthn options for the browser. */
@@ -50,18 +52,54 @@ export interface Passkey {
 
 // ---------------------------------------------------------------- account
 
+/**
+ * A person of the account. `access_until`, `permissions` and `active` come only from an application with a permission
+ * catalog (people.Options.Permissions): the end of the person's access (null: none), the application's permission
+ * ids ("all": everything) and whether the person may still sign in.
+ */
 export interface Member {
   id: string
   name: string
   role: Role
   joined_at: string
   you: boolean
+  access_until?: string | null
+  permissions?: string[] | null
+  active?: boolean
 }
 
 export interface InviteRow {
   id: string
   name: string
   expires_at: string
+  /** "owner" for a co-owner's invite (people.Options.CoOwners) */
+  role?: Role
+  access_until?: string | null
+  permissions?: string[] | null
+}
+
+/**
+ * One permission of the application's catalog (core.PermissionInfo): the invite sheet and the member detail show it
+ * as a tick, under its group. A title or group may be a label map ({"ru": …, "en": …}).
+ */
+export interface PermissionInfo {
+  id: string
+  title: string | Record<string, string>
+  group?: string | Record<string, string>
+}
+
+/** POST /api/account/invites; the access fields only with a catalog, `role` only with co-owners. */
+export interface InviteBody {
+  name: string
+  access_until?: string
+  permissions?: string[]
+  role?: Role
+}
+
+/** PATCH /api/account/members/{id}: a field left out stays; access_until null removes the end. */
+export interface MemberPatch {
+  access_until?: string | null
+  permissions?: string[]
 }
 
 /** GET /api/account; an application adds its own fields (Family Hub: `modules`). */

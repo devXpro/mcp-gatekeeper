@@ -105,6 +105,39 @@ func TestSingleResourceFlow(t *testing.T) {
 	assert.Equal(t, hubURL+"/mcp", got.resourceURL)
 }
 
+// TestSingleResourceScopeOfAnotherID is review GK-7: a scope may name only an id that its path gives back, so with
+// core.SingleResource only the resource's own. This catalog can also connect notes and photos, as one that answers
+// for more ids may; the scope mcp:notes used to get a consent, a grant and tokens for notes whose resource URL was
+// the home's /mcp, a connection the MCP access check then refused.
+func TestSingleResourceScopeOfAnotherID(t *testing.T) {
+	h := newHomeHarness(t)
+	tc := h.registerDCR(claudeCallback, authNone)
+	_, err := h.catalog.Resource(t.Context(), "notes")
+	require.NoError(t, err, "the catalog can connect notes")
+	for _, scope := range []string{"mcp:notes", "offline_access mcp:photos", "mcp:other", "mcp:Home"} {
+		t.Run(scope, func(t *testing.T) {
+			_, challenge := newPKCE()
+			q := homeParams(tc, challenge)
+			q.Del("resource")
+			q.Set("scope", scope)
+			w := h.authorize(q)
+			require.Equal(t, http.StatusFound, w.Code, w.Body.String())
+			back := location(t, w).Query()
+			assert.Equal(t, "invalid_scope", back.Get("error"))
+			assert.Equal(t, "the scope names no module of this hub", back.Get("error_description"))
+		})
+	}
+	assert.Zero(t, h.srv.txns.count())
+
+	_, challenge := newPKCE()
+	q := homeParams(tc, challenge)
+	q.Set("scope", "mcp:notes")
+	w := h.authorize(q)
+	require.Equal(t, http.StatusFound, w.Code)
+	assert.Equal(t, "the scope names another module than the resource", location(t, w).Query().Get("error_description"),
+		"next to the resource, as before")
+}
+
 func TestSingleResourceRefusals(t *testing.T) {
 	h := newHomeHarness(t)
 	tc := h.registerDCR(claudeCallback, authNone)

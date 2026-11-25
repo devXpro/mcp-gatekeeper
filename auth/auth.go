@@ -58,6 +58,10 @@ type Options struct {
 	AdminCLI string
 	// ResetSteps are the application's parts of reset-access (Family Hub: deleting the superadmin's legacy keys).
 	ResetSteps []ResetStep
+	// OnAccessReset, when set, is called after reset-access succeeded, so the application can raise an "access was
+	// reset" alert where its owner looks (review GK-5: on a desktop any program of the same user reaches the socket).
+	// It runs on the command's goroutine with a context that is not cancelled; keep it short.
+	OnAccessReset func(ctx context.Context, r AccessReset)
 }
 
 // Auth is the passkey, session and invite service. It is safe for concurrent use.
@@ -70,6 +74,7 @@ type Auth struct {
 	wa       *webauthn.WebAuthn
 	adminCLI string
 	steps    []ResetStep
+	onReset  func(context.Context, AccessReset)
 
 	ceremonies *ceremonies
 	limits     limits
@@ -84,11 +89,15 @@ type Auth struct {
 var _ core.Sessions = (*Auth)(nil)
 var _ core.RouteRegistrar = (*Auth)(nil)
 
-// New checks the options and returns an Auth. Site.PublicURL must be an origin (scheme, host, optional port, nothing
-// else). With Options.Admin set, it registers auth's admin commands there.
+// New checks the options and returns an Auth. The Site must pass core.Site.Validate: PublicURL an origin (scheme,
+// host, optional port, nothing else) and a known client address mode. With Options.Admin set, it registers auth's
+// admin commands there.
 func New(o Options) (*Auth, error) {
 	if o.Store == nil {
 		return nil, errors.New("auth: a store is required")
+	}
+	if err := o.Site.Validate(); err != nil {
+		return nil, fmt.Errorf("auth: %w", err)
 	}
 	site, err := checkSite(o.Site)
 	if err != nil {
@@ -118,7 +127,7 @@ func New(o Options) (*Auth, error) {
 	}
 	a := &Auth{
 		site: site, brand: o.Brand, st: o.Store, log: log, now: func() time.Time { return clock().UTC() }, wa: wa,
-		adminCLI: adminCLI, steps: append([]ResetStep(nil), o.ResetSteps...),
+		adminCLI: adminCLI, steps: append([]ResetStep(nil), o.ResetSteps...), onReset: o.OnAccessReset,
 		ceremonies: newCeremonies(), limits: newLimits(), fails: newFailedLogins(),
 	}
 	if o.Admin != nil {
@@ -223,14 +232,28 @@ func (a *Auth) Stop(ctx context.Context) error {
 }
 
 // sweep deletes the sessions past their absolute end or idle for too long. Viewer refuses them anyway; this removes
-// the abandoned ones.
+// the abandoned ones. A store that cannot expire rows by itself (store.Purger: sqlitestore) purges the rest of what
+// has expired here too (review GK-3).
 func (a *Auth) sweep(ctx context.Context) {
-	n, err := a.st.Sessions().DeleteExpired(ctx, a.now(), IdleTimeout)
+	now := a.now()
+	n, err := a.st.Sessions().DeleteExpired(ctx, now, IdleTimeout)
 	switch {
 	case err != nil && ctx.Err() == nil:
 		a.log.Warn("auth: cannot delete expired sessions", slog.Any("error", err))
 	case n > 0:
 		a.log.Debug("auth: deleted expired sessions", slog.Int("sessions", n))
+	}
+	p, ok := a.st.(store.Purger)
+	if !ok {
+		return
+	}
+	ps, err := p.Purge(ctx, now)
+	switch {
+	case err != nil && ctx.Err() == nil:
+		a.log.Warn("auth: cannot purge expired records", slog.Any("error", err))
+	case err == nil && ps != (store.PurgeStats{}):
+		a.log.Debug("auth: purged expired records", slog.Int("tokens", ps.Tokens), slog.Int("codes", ps.Codes),
+			slog.Int("invites", ps.Invites), slog.Int("audit", ps.Audit), slog.Int("clients", ps.Clients))
 	}
 }
 

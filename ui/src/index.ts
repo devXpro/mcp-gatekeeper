@@ -3,10 +3,22 @@
 
 // Setup and the application's wiring
 export { configure, type GatekeeperConfig } from './setup'
-export { brand, storageKey, type Brand } from './config'
+export { brand, features, storageKey, type Brand, type Features } from './config'
 export { AppProvider, GatekeeperApp, type AppOptions, type GatekeeperAppProps } from './app/GatekeeperApp'
 export { gatekeeperRoutes, type RouteOptions } from './app/routes'
-export { AppContext, useApp, type AppSlots, type CardSlotProps, type ConnectSlots, type Resource, type ResourceTileProps, type TabDef } from './app/context'
+export {
+  AppContext,
+  tabVisible,
+  useApp,
+  useLiveMode,
+  type AppSlots,
+  type CardSlotProps,
+  type ConnectSlots,
+  type LiveMode,
+  type Resource,
+  type ResourceTileProps,
+  type TabDef,
+} from './app/context'
 
 // The design system (components/ui) and the shared components
 export * from './components/ui/button'
@@ -33,6 +45,8 @@ export { AppearancePage, LanguagePage } from './features/account/ChoicePages'
 export { DeletePage } from './features/account/DeletePage'
 export { Farewell } from './features/account/Farewell'
 export { InviteSheet } from './features/account/InviteSheet'
+export { PermissionPicker, TermPicker } from './features/account/AccessPickers'
+export { MemberSheet, type MemberOpen } from './features/account/MemberSheet'
 export { PasskeysPage } from './features/account/PasskeysPage'
 export { FamiliesSection } from './features/admin/Families'
 export { AccountAuditPage, AuditPage } from './features/audit/AuditPage'
@@ -52,6 +66,7 @@ export { ACCOUNT_TAB, CONNECT_TAB, DEFAULT_TABS } from './features/shell/tabdefs
 export { currentLang, default as i18n, detectLang, label, packageStrings, setLanguage, useLang, type Strings } from './i18n'
 
 // Helpers
+export * from './lib/access'
 export * from './lib/api'
 export * from './lib/assistant'
 export * from './lib/clipboard'

@@ -153,6 +153,17 @@ func (f fakeInviter) IssueInvite(ctx context.Context, kind core.InviteKind, acco
 
 func (f fakeInviter) IssueInviteIn(ctx context.Context, st store.Store, kind core.InviteKind,
 	account core.AccountID, name string, by core.PersonID) (people.IssuedInvite, error) {
+	return f.issue(ctx, st, kind, account, name, by, nil, nil)
+}
+
+// IssueInviteWithAccess makes fakeInviter a people.AccessInviter.
+func (f fakeInviter) IssueInviteWithAccess(ctx context.Context, kind core.InviteKind, account core.AccountID,
+	name string, by core.PersonID, until *time.Time, perms []string) (people.IssuedInvite, error) {
+	return f.issue(ctx, f.st, kind, account, name, by, until, perms)
+}
+
+func (f fakeInviter) issue(ctx context.Context, st store.Store, kind core.InviteKind, account core.AccountID,
+	name string, by core.PersonID, until *time.Time, perms []string) (people.IssuedInvite, error) {
 	if kind != core.InviteOwner && kind != core.InviteMember {
 		return people.IssuedInvite{}, fmt.Errorf("auth: invites of kind %q are not issued here", kind)
 	}
@@ -170,12 +181,45 @@ func (f fakeInviter) IssueInviteIn(ctx context.Context, st store.Store, kind cor
 	_, _ = rand.Read(b)
 	token, now := base64.RawURLEncoding.EncodeToString(b), time.Now().UTC()
 	inv := core.Invite{ID: core.NewID(core.PrefixInvite), TokenHash: hashToken(token), Kind: kind, AccountID: account,
-		Name: name, CreatedBy: by, CreatedAt: now, ExpiresAt: now.Add(inviteTTL)}
+		Name: name, CreatedBy: by, CreatedAt: now, ExpiresAt: now.Add(inviteTTL), AccessUntil: until,
+		Permissions: perms}
 	if err := st.Invites().Create(ctx, inv); err != nil {
 		return people.IssuedInvite{}, fmt.Errorf("auth: store an invite: %w", err)
 	}
 	return people.IssuedInvite{ID: inv.ID, URL: publicURL + "/join#t=" + token, ExpiresAt: inv.ExpiresAt}, nil
 }
+
+// plainInviter is an Inviter that is not an AccessInviter (Family Hub's).
+type plainInviter struct{ people.Inviter }
+
+// --- the permission catalog of an application that offers terms and permissions (Homie: plugins) ---
+
+type fakeCatalog struct {
+	mu   sync.Mutex
+	list []core.PermissionInfo
+	err  error
+}
+
+func newCatalog() *fakeCatalog {
+	return &fakeCatalog{list: []core.PermissionInfo{
+		{ID: "plugin:tv", Title: "TV", Group: "Devices"},
+		{ID: "plugin:light", Title: "Light", Group: "Devices"},
+		{ID: "plugin:notes", Title: "Notes", Group: "Other"},
+	}}
+}
+
+func (c *fakeCatalog) Permissions(context.Context, core.AccountID) ([]core.PermissionInfo, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.list), c.err
+}
+
+// withCatalog turns terms and permissions on with cat.
+func withCatalog(cat *fakeCatalog) func(*people.Options) {
+	return func(o *people.Options) { o.Permissions = cat }
+}
+
+func withCoOwners(o *people.Options) { o.CoOwners = true }
 
 // --- the grant revoker ((*oauth.Server).RevokeGrant): revokes in the store and audits oauth.grant.revoke ---
 

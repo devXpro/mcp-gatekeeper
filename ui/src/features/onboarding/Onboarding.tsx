@@ -42,9 +42,9 @@ function takeToken(): string | null {
 type Step = 'checking' | 'problem' | 'welcome' | 'name' | 'family' | 'passkey' | 'done'
 type Problem = 'invalid' | 'offline' | 'error'
 
-/** The steps a kind of link walks, after the check. */
-function stepsFor(kind: InviteKind): Step[] {
-  return kind === 'member' ? ['welcome', 'name', 'passkey', 'done'] : ['welcome', 'name', 'family', 'passkey', 'done']
+/** The steps a kind of link walks, after the check. A co-owner joins an account that is named already. */
+function stepsFor(kind: InviteKind, coOwner: boolean): Step[] {
+  return kind === 'member' || coOwner ? ['welcome', 'name', 'passkey', 'done'] : ['welcome', 'name', 'family', 'passkey', 'done']
 }
 
 export function Onboarding({ route }: { route: 'setup' | 'join' }) {
@@ -86,7 +86,9 @@ export function Onboarding({ route }: { route: 'setup' | 'join' }) {
     }
   }, [token])
 
-  const order = info ? stepsFor(info.kind) : []
+  // An owner invite into an account that has an owner (POST /api/auth/token says co_owner): join it as it is.
+  const coOwner = info?.kind === 'owner' && !!info.co_owner
+  const order = info ? stepsFor(info.kind, coOwner) : []
   const go = (to: Step) => {
     setDir(order.indexOf(to) >= order.indexOf(step) ? 1 : -1)
     setFieldError(undefined)
@@ -109,7 +111,7 @@ export function Onboarding({ route }: { route: 'setup' | 'join' }) {
     let phase: 'begin' | 'ceremony' | 'finish' = 'begin'
     try {
       const body: Record<string, string> = { token, name: name.trim() }
-      if (info.kind !== 'member') body.account_name = family.trim()
+      if (info.kind !== 'member' && !coOwner) body.account_name = family.trim()
       const begin = await api.post<Begin>('/auth/register/begin', body)
       phase = 'ceremony'
       const credential = await createCredential(begin.options)
@@ -138,6 +140,8 @@ export function Onboarding({ route }: { route: 'setup' | 'join' }) {
   if (step === 'problem' && problem === 'offline') return <OfflineScreen onRetry={() => window.location.reload()} />
 
   const kind = info?.kind ?? (route === 'setup' ? 'setup' : 'member')
+  // The copy of the welcome and done steps: a co-owner has its own.
+  const copy = coOwner ? 'co_owner' : kind
   const glyph = <PasskeyGlyph className="size-16 text-accent" />
   let content: ReactNode
   let action: ReactNode
@@ -172,13 +176,11 @@ export function Onboarding({ route }: { route: 'setup' | 'join' }) {
             <h1 className="mt-8 type-title-1 text-balance">
               {kind === 'setup'
                 ? t('onboarding.welcome.setup.title')
-                : kind === 'owner'
-                  ? t('onboarding.welcome.owner.title', { family: quote(info?.account_name ?? '', lang) })
-                  : t('onboarding.welcome.member.title', { family: quote(info?.account_name ?? '', lang) })}
+                : t(`onboarding.welcome.${copy}.title`, { family: quote(info?.account_name ?? '', lang) })}
             </h1>
           </Rise>
           <Rise delay={0.16}>
-            <p className="prose-ru mt-3 type-callout text-balance text-label-2">{t(`onboarding.welcome.${kind}.text`)}</p>
+            <p className="prose-ru mt-3 type-callout text-balance text-label-2">{t(`onboarding.welcome.${copy}.text`)}</p>
           </Rise>
         </div>
       )
@@ -287,7 +289,7 @@ export function Onboarding({ route }: { route: 'setup' | 'join' }) {
           </Rise>
           <Rise delay={0.28}>
             <p className="prose-ru mt-3 type-callout text-balance text-label-2">
-              {t(`onboarding.done.${kind}`, { family: quote(family.trim() || (info?.account_name ?? ''), lang) })}
+              {t(`onboarding.done.${copy}`, { family: quote(family.trim() || (info?.account_name ?? ''), lang) })}
             </p>
           </Rise>
         </div>

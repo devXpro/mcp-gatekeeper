@@ -1,10 +1,13 @@
 package mcpguard
 
 import (
+	"errors"
 	"io"
 	"net/http"
+	"os"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/devXpro/mcp-gatekeeper/httpsec"
 )
@@ -66,8 +69,14 @@ func copyHeaderPrefixes(dst, src http.Header, prefixes []string) {
 }
 
 // ReadBody buffers the request body: 413 above MaxBodyBytes, whether Content-Length says so or the body runs over,
-// and 400 when it cannot be read. ok is false once an answer is written.
+// 408 when the client takes longer than httpsec.BodyReadTimeout to send it (review GK-17: a call holds its in-flight
+// place while its body comes), and 400 when it cannot be read. ok is false once an answer is written. A body read in
+// full leaves no read deadline behind, so a long answer (an event stream) is not cut.
 func ReadBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	return readBody(w, r, httpsec.BodyReadTimeout)
+}
+
+func readBody(w http.ResponseWriter, r *http.Request, timeout time.Duration) ([]byte, bool) {
 	if r.ContentLength > MaxBodyBytes {
 		httpsec.WriteError(w, http.StatusRequestEntityTooLarge, httpsec.CodeInvalid, "the request body is too large")
 		return nil, false
@@ -75,14 +84,19 @@ func ReadBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	if r.Body == nil {
 		return nil, true
 	}
+	lift := httpsec.BodyDeadline(w, timeout)
 	b, err := io.ReadAll(io.LimitReader(r.Body, MaxBodyBytes+1))
-	if err != nil {
+	switch {
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		httpsec.WriteError(w, http.StatusRequestTimeout, httpsec.CodeInvalid, "the request body was not sent in time")
+		return nil, false
+	case err != nil:
 		httpsec.WriteError(w, http.StatusBadRequest, httpsec.CodeInvalid, "the request body cannot be read")
 		return nil, false
-	}
-	if len(b) > MaxBodyBytes {
+	case len(b) > MaxBodyBytes:
 		httpsec.WriteError(w, http.StatusRequestEntityTooLarge, httpsec.CodeInvalid, "the request body is too large")
 		return nil, false
 	}
+	lift()
 	return b, true
 }
