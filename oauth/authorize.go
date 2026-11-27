@@ -53,9 +53,7 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		s.clientPage(w, err)
 		return
 	}
-	// The callback rules are applied again, so a client stored before RefuseConnectorCallback was set cannot use a
-	// per-connector callback either.
-	if !slices.Contains(client.RedirectURIs, redirectURI) || callbackAssistant(redirectURI, s.cfg.connector) == "" {
+	if !s.redirectAllowed(client, redirectURI) {
 		s.page(w, http.StatusBadRequest, pageBadRedirect)
 		return
 	}
@@ -88,6 +86,20 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusFound)
 }
 
+// redirectAllowed reports whether redirectURI may receive the answer of an authorization request of client. An
+// assistant's client must name one of its callbacks exactly, and the callback rules are applied again, so a client
+// stored before RefuseConnectorCallback was set cannot use a per-connector callback either. A native app's client,
+// while its app is declared, names one of its loopback callbacks with any port (RFC 8252 §7.3): scheme, host and path
+// exact.
+func (s *Server) redirectAllowed(client core.OAuthClient, redirectURI string) bool {
+	if _, native := NativeAppID(client.Assistant); native {
+		registered, ok := loopbackCallback(redirectURI)
+		_, declared := s.nativeApp(client.Assistant)
+		return ok && declared && slices.Contains(client.RedirectURIs, registered)
+	}
+	return slices.Contains(client.RedirectURIs, redirectURI) && callbackAssistant(redirectURI, s.cfg.connector) != ""
+}
+
 // browserBinding is the value of the browser's binding cookie: the one it sent, or a new one. One value per browser
 // lets two connectors started in it wait for consent side by side.
 func (s *Server) browserBinding(r *http.Request) string {
@@ -112,8 +124,12 @@ func (s *Server) setBindingCookie(w http.ResponseWriter, value string) {
 // startedFrom says where the browser came from to authorize (T2.R H1): startedAssistant when the Referer is a host of
 // the client's assistant, startedElsewhere when it is another site or the address was opened directly
 // (Sec-Fetch-Site: none, e.g. a link from a messenger), and startedUnknown without either. The live test of the
-// assistants' windows calibrates it.
+// assistants' windows calibrates it. A native app's request is startedApp: the app opens the system browser, which
+// sends neither, and its code can only come back to a loopback address on the person's own computer.
 func startedFrom(r *http.Request, a core.Assistant) string {
+	if _, native := NativeAppID(a); native {
+		return startedApp
+	}
 	if ref := r.Referer(); ref != "" {
 		if u, err := url.Parse(ref); err == nil && u.Scheme == "https" && callbackHosts[u.Hostname()] == a {
 			return startedAssistant
