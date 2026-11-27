@@ -176,8 +176,10 @@ export interface ConsentTxn {
   resource: ConsentResource
   account: AccountRef
   already_granted: boolean
-  started_from?: 'assistant' | 'elsewhere' | 'unknown'
+  started_from?: 'assistant' | 'elsewhere' | 'unknown' | 'app'
   client_kind?: 'dcr' | 'cimd'
+  /** a native app of the application (`assistant` is `app:<id>`): it returns to a loopback callback on this computer */
+  app?: { id: string; name: string }
 }
 
 /** approve and deny */
