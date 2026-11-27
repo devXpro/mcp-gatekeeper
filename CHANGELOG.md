@@ -4,6 +4,25 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 the project follows [Semantic Versioning](https://semver.org/) (while it is below 1.0, a minor version may change an
 API).
 
+## [Unreleased]
+
+Everything new is optional: without declared native apps, every answer toward assistants and the SPA is v0.2.0's,
+byte for byte (`TestAssistantsUnchangedByNativeApps`, and the existing byte tests unchanged).
+
+### Added
+
+- **Native apps with a loopback redirect (RFC 8252).** `oauth.Options.NativeApps` with `oauth.NativeApp{ID, Name}`,
+  `oauth.AppAssistantPrefix` and `oauth.NativeAppID`. A declared app registers by DCR with
+  `http://127.0.0.1/oauth/callback` or `http://[::1]/oauth/callback` (no port, never `localhost`), its `ID` as
+  `software_id` and `token_endpoint_auth_method` `none`; the answer carries `software_id`. Its client's assistant is
+  `app:<ID>`. Authorize matches its loopback callback with any port, scheme, host and path exact; PKCE S256 is
+  required as for everyone, and a client of an app no longer declared is refused there. Tokens and refresh are
+  unchanged.
+- The consent view's `app: {id, name}` and `started_from: "app"` for a native app's transaction.
+- **UI package:** the consent screen names a native app ("<Name> on your computer"), keeps the client's own name in
+  the App row, asks in its footnote whether the person started connecting the app, and lets approve return to the
+  app's loopback callback (http on `127.0.0.1` or `[::1]`, for a native app only).
+
 ## [0.2.0] - 2026-11-25
 
 Everything new is optional: with the default options, the answers toward assistants, the cookies, the routes, the
@@ -96,5 +115,6 @@ use.
 - `ui/`: the admin UI package.
 - Single-resource and per-resource MCP layouts (`core.SingleResource`, `core.PerResource`).
 
+[Unreleased]: https://github.com/devXpro/mcp-gatekeeper/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/devXpro/mcp-gatekeeper/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/devXpro/mcp-gatekeeper/releases/tag/v0.1.0

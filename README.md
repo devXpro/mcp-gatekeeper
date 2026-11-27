@@ -17,6 +17,27 @@ Extracted from [Family Hub](docs/PLAN.md) and shared with [Homie](https://github
 
 Current version: **v0.2.0**.
 
+## Native apps (unreleased)
+
+An application can let its own programs connect from the person's computer, next to ChatGPT and Claude, with a
+loopback redirect (RFC 8252). Without a declared app nothing changes, byte for byte.
+
+```go
+oauth.New(oauth.Options{ /* ... */ NativeApps: []oauth.NativeApp{{ID: "desk", Name: "Desk"}}})
+```
+
+- The app registers by DCR as a public client: `redirect_uris` exactly `["http://127.0.0.1/oauth/callback"]` (or
+  `http://[::1]/oauth/callback`; never `localhost`, never a port), `software_id` its `ID`,
+  `token_endpoint_auth_method` `none`, and a `client_name` such as the computer's name.
+- It authorizes with `redirect_uri` `http://127.0.0.1:<any port>/oauth/callback` and PKCE S256, then exchanges the
+  code with the same `redirect_uri`. Tokens, refresh and the resource are as for everyone.
+- Its client's `core.Assistant` is `app:<ID>` (`oauth.NativeAppID` reads it back): `AccessInfo.Assistant`, grants and
+  the audit carry it, and the application maps it to its own label.
+- The consent screen calls it "Desk on your computer" with the client's name in the App row, and skips the
+  "not opened from the assistant" warning, which a system browser would always trip (`started_from` is `app`).
+
+The rules in full are in [docs/security/G4.md](docs/security/G4.md#clients).
+
 ## What v0.2 adds
 
 Everything below is optional. An application that does not use it gets the v0.1 behaviour, byte for byte.
