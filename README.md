@@ -15,7 +15,7 @@ Extracted from [Family Hub](docs/PLAN.md) and shared with [Homie](https://github
   one conformance suite (`store/storetest`).
 - **Admin UI:** a React package in `ui/`, consumed by a git tag (see [ui/README.md](ui/README.md)).
 
-Current version: **v0.3.0**.
+Current version: **v0.4.0**.
 
 ## Native apps (unreleased)
 
