@@ -329,6 +329,12 @@ function Consent({
         aria-hidden={done || undefined}
       >
         <div className="mx-auto flex max-w-[448px] flex-col gap-1">
+          {/* A native app's answer goes to a loopback port: the address is said where the finger is (review SR M1). */}
+          {txn.app && (
+            <p id="consent-return" className="px-2 pb-1 text-center type-footnote text-balance text-label-2">
+              {t('consent.native.return', { address: txn.redirect_host })}
+            </p>
+          )}
           {/* Always said, right where the finger is: a phished link is the one Allow that was not asked for (H1). */}
           <p id="consent-only-yours" className={cn('px-2 pb-2 text-center type-footnote text-balance', elsewhere ? 'text-danger-text' : 'text-label-2')}>
             {txn.app ? t('consent.only_yours.native', { app: txn.app.name }) : t('consent.only_yours')}
@@ -344,7 +350,7 @@ function Consent({
             loading={busy === 'approve'}
             disabled={!!busy || done}
             onClick={() => void answer('approve')}
-            aria-describedby="consent-only-yours"
+            aria-describedby={txn.app ? 'consent-return consent-only-yours' : 'consent-only-yours'}
           >
             {t('consent.allow')}
           </Button>
