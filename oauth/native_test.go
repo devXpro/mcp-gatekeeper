@@ -5,6 +5,7 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
 	"slices"
 	"strings"
@@ -144,6 +145,10 @@ func TestNewRefusesBadNativeApps(t *testing.T) {
 		"an invisible name":     {{ID: "desk", Name: bidiOverride + "Desk"}},
 		"a name over 64 runes":  {{ID: "desk", Name: strings.Repeat("я", 65)}},
 		"a name with a newline": {{ID: "desk", Name: "De\nsk"}},
+		"port 0":                {{ID: "desk", Name: "Desk", Ports: []int{0}}},
+		"port 65536":            {{ID: "desk", Name: "Desk", Ports: []int{8742, 65536}}},
+		"a negative port":       {{ID: "desk", Name: "Desk", Ports: []int{-1}}},
+		"a port twice":          {{ID: "desk", Name: "Desk", Ports: []int{8742, 8743, 8742}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t)
@@ -278,12 +283,32 @@ func TestRegisterLoopbackWithoutNativeApps(t *testing.T) {
 	}
 }
 
+// authorizeFromApp sends the authorization request params as the system browser a native app opened sends it:
+// no Referer, Sec-Fetch-Site: none.
+func (h *harness) authorizeFromApp(params url.Values) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+params.Encode(), nil)
+	r.Header.Set("Sec-Fetch-Site", "none")
+	return h.do(r)
+}
+
+// startAppTxn is startTxn for the resource notes from the app's system browser; it returns the transaction id and
+// the PKCE verifier.
+func (h *harness) startAppTxn(tc testClient) (string, string) {
+	h.t.Helper()
+	verifier, challenge := newPKCE()
+	w := h.authorizeFromApp(authorizeParams(tc, "notes", challenge))
+	require.Equal(h.t, http.StatusFound, w.Code, w.Body.String())
+	id, ok := strings.CutPrefix(w.Header().Get("Location"), "/consent?txn=")
+	require.True(h.t, ok, w.Header().Get("Location"))
+	return id, verifier
+}
+
 // TestNativeAppFlow walks a native app through registration, authorize on a port of its own, the consent screen,
 // approve, the code exchange, the access check and a refresh.
 func TestNativeAppFlow(t *testing.T) {
 	h := newNativeHarness(t)
 	tc := h.registerNative("Work laptop", nativeAt(53211))
-	txnID, verifier := h.startTxn(tc, "notes")
+	txnID, verifier := h.startAppTxn(tc)
 
 	w := h.get("/api/oauth/txn/"+txnID, "alice")
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -448,4 +473,135 @@ func TestAssistantsUnchangedByNativeApps(t *testing.T) {
 	assert.Contains(t, without[2], `"started_from":"unknown"`)
 	assert.NotContains(t, strings.Join(without, "\n"), `"app"`)
 	assert.NotContains(t, strings.Join(without, "\n"), "software_id")
+}
+
+// txnStartedFrom sends the authorization request of tc with the Referer and Sec-Fetch-Site values given ("" leaves a
+// header out) and returns the started_from of its consent view.
+func (h *harness) txnStartedFrom(tc testClient, referer string, site ...string) string {
+	h.t.Helper()
+	_, challenge := newPKCE()
+	r := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+authorizeParams(tc, "notes", challenge).Encode(), nil)
+	if referer != "" {
+		r.Header.Set("Referer", referer)
+	}
+	for _, v := range site {
+		r.Header.Add("Sec-Fetch-Site", v)
+	}
+	w := h.do(r)
+	require.Equal(h.t, http.StatusFound, w.Code, w.Body.String())
+	id, _ := strings.CutPrefix(w.Header().Get("Location"), "/consent?txn=")
+	var view txnView
+	v := h.get("/api/oauth/txn/"+id, "alice")
+	require.Equal(h.t, http.StatusOK, v.Code, v.Body.String())
+	decode(h.t, v, &view)
+	return view.StartedFrom
+}
+
+// TestNativeStartedFrom: a native app's request is "app" (no warning) only when the browser was not navigated from a
+// page, Sec-Fetch-Site: none and no Referer (review SR M1); everything else warns.
+func TestNativeStartedFrom(t *testing.T) {
+	tests := []struct {
+		name    string
+		referer string
+		site    []string
+		want    string
+	}{
+		{"the system browser the app opened", "", []string{"none"}, startedApp},
+		{"a link on a web page", "https://evil.example/post", []string{"cross-site"}, startedElsewhere},
+		{"a web page with its Referer suppressed", "", []string{"cross-site"}, startedElsewhere},
+		{"a page on a sibling host", "", []string{"same-site"}, startedElsewhere},
+		{"the server's own page", hubURL + "/account", []string{"same-origin"}, startedElsewhere},
+		{"a loopback page of another program", "", []string{"cross-site"}, startedElsewhere},
+		{"none with a Referer", "https://evil.example/", []string{"none"}, startedElsewhere},
+		{"no Sec-Fetch-Site at all", "", nil, startedElsewhere},
+		{"Sec-Fetch-Site twice", "", []string{"none", "cross-site"}, startedElsewhere},
+		{"an unknown value", "", []string{"None"}, startedElsewhere},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newNativeHarness(t)
+			tc := h.registerNative("Work laptop", nativeAt(53211))
+			assert.Equal(t, tt.want, h.txnStartedFrom(tc, tt.referer, tt.site...))
+		})
+	}
+}
+
+// TestNativeAppPorts: with NativeApp.Ports, the loopback redirect must use one of them; other apps keep any port.
+func TestNativeAppPorts(t *testing.T) {
+	pinned := NativeApp{ID: "desk", Name: "Desk", Ports: []int{8742, 8743}}
+	free := NativeApp{ID: "other", Name: "Other"}
+	h := newHarnessWith(t, func(o *Options) { o.NativeApps = []NativeApp{pinned, free} })
+	w := h.registerJSON(map[string]any{
+		"redirect_uris": []string{nativeCallback, nativeCallbackV6}, "token_endpoint_auth_method": "none",
+		"software_id": "desk",
+	})
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+	var reg registered
+	decode(t, w, &reg)
+	tc := testClient{id: reg.ClientID}
+
+	for _, uri := range []string{nativeAt(8742), nativeAt(8743), "http://[::1]:8742/oauth/callback"} {
+		tc.redirect = uri
+		h.startAppTxn(tc)
+	}
+	for _, uri := range []string{nativeAt(8744), nativeAt(53211), nativeAt(80), nativeCallback, nativeCallbackV6} {
+		tc.redirect = uri
+		_, challenge := newPKCE()
+		assertPage(t, h.authorizeFromApp(authorizeParams(tc, "notes", challenge)), http.StatusBadRequest, pageBadRedirect)
+	}
+
+	w = h.registerJSON(map[string]any{
+		"redirect_uris": []string{nativeCallback}, "token_endpoint_auth_method": "none", "software_id": "other",
+	})
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+	decode(t, w, &reg)
+	for _, uri := range []string{nativeAt(8744), nativeAt(53211), nativeCallback} {
+		h.startAppTxn(testClient{id: reg.ClientID, redirect: uri})
+	}
+}
+
+// TestNativeConsentPhishing is review SR M1: someone registers their own client of the app by open DCR, keeps the
+// PKCE verifier and sends the person an authorize link whose loopback port they listen on. The consent screen warns
+// when the link was opened from a page, the address it returns to is on it, and with the app's Ports the link to a
+// port of their own is refused outright.
+func TestNativeConsentPhishing(t *testing.T) {
+	const attackerPort = 49152
+	t.Run("any port: the warning and the return address", func(t *testing.T) {
+		h := newNativeHarness(t)
+		attacker := h.registerNative("Desk on MacBook", nativeAt(attackerPort))
+		_, challenge := newPKCE()
+		r := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+authorizeParams(attacker, "notes", challenge).Encode(), nil)
+		r.Header.Set("Referer", "https://mail.example.com/inbox")
+		r.Header.Set("Sec-Fetch-Site", "cross-site")
+		w := h.do(r)
+		require.Equal(t, http.StatusFound, w.Code)
+		id, _ := strings.CutPrefix(w.Header().Get("Location"), "/consent?txn=")
+		var view txnView
+		v := h.get("/api/oauth/txn/"+id, "alice")
+		require.Equal(t, http.StatusOK, v.Code, v.Body.String())
+		decode(t, v, &view)
+		assert.Equal(t, startedElsewhere, view.StartedFrom, "the red warning is shown")
+		assert.Equal(t, fmt.Sprintf("127.0.0.1:%d", attackerPort), view.RedirectHost, "the return address is shown")
+		assert.Equal(t, core.ClientDCR, view.ClientKind, "the client's name is marked as self-declared")
+	})
+	t.Run("declared ports: the link is refused", func(t *testing.T) {
+		h := newHarnessWith(t, func(o *Options) {
+			o.NativeApps = []NativeApp{{ID: deskApp.ID, Name: deskApp.Name, Ports: []int{8742}}}
+		})
+		attacker := h.registerNative("Desk on MacBook", nativeAt(attackerPort))
+		_, challenge := newPKCE()
+		assertPage(t, h.authorizeFromApp(authorizeParams(attacker, "notes", challenge)), http.StatusBadRequest,
+			pageBadRedirect)
+		assert.Zero(t, h.srv.txns.count(), "no transaction, no consent screen")
+
+		// The app's own port works, and the screen names it.
+		attacker.redirect = nativeAt(8742)
+		txnID, _ := h.startAppTxn(attacker)
+		var view txnView
+		v := h.get("/api/oauth/txn/"+txnID, "alice")
+		require.Equal(t, http.StatusOK, v.Code, v.Body.String())
+		decode(t, v, &view)
+		assert.Equal(t, startedApp, view.StartedFrom)
+		assert.Equal(t, "127.0.0.1:8742", view.RedirectHost)
+	})
 }

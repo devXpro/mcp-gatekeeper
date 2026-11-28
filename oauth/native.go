@@ -3,6 +3,7 @@ package oauth
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/devXpro/mcp-gatekeeper/core"
@@ -14,6 +15,11 @@ import (
 type NativeApp struct {
 	ID   string // ^[a-z][a-z0-9-]{1,30}$, e.g. "desk"; the software_id of its registrations
 	Name string // what the consent screen calls it, e.g. "Desk"; at most 64 characters, none invisible
+
+	// Ports, when set, are the only loopback ports the app's redirect may use (1 to 65535, no repeats): another
+	// program on the computer that listens on a port of its own cannot receive the app's code then. None (the
+	// default) allows any port, as RFC 8252 §7.3 describes.
+	Ports []int
 }
 
 // AppAssistantPrefix starts the core.Assistant of a native app's client: "app:<ID>".
@@ -47,6 +53,12 @@ func nativeApps(apps []NativeApp) (map[string]NativeApp, error) {
 			return nil, fmt.Errorf("oauth: the name %q of the native app %q is empty, over %d characters or has "+
 				"invisible characters or spaces around it", a.Name, a.ID, maxNameRunes)
 		}
+		for i, p := range a.Ports {
+			if p < 1 || p > 65535 || slices.Contains(a.Ports[:i], p) {
+				return nil, fmt.Errorf("oauth: the port %d of the native app %q is not 1 to 65535 or comes twice", p, a.ID)
+			}
+		}
+		a.Ports = slices.Clone(a.Ports)
 		out[a.ID] = a
 	}
 	return out, nil

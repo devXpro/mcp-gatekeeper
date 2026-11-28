@@ -168,3 +168,16 @@ func loopbackCallback(raw string) (string, bool) {
 	}
 	return registered, true
 }
+
+// loopbackPort is the port of a redirect URI loopbackCallback accepted: its own, or 80 without one (http's).
+func loopbackPort(raw string) int {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return 0
+	}
+	if u.Port() == "" {
+		return 80
+	}
+	n, _ := strconv.Atoi(u.Port())
+	return n
+}
