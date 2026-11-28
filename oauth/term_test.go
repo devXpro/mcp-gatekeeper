@@ -251,6 +251,7 @@ func TestTokenRefusalOfAPersonKeepsReuseDetection(t *testing.T) {
 	end := h.clock.now()
 	h.setTerm(bob.Person.ID, &end)
 
+	h.clock.advance(refreshGrace + time.Second)
 	assert.Equal(t, http.StatusBadRequest, h.refresh(tc, first.RefreshToken).Code)
 	assert.Equal(t, 1, h.store.auditActions()["oauth.refresh.reuse"])
 	assert.False(t, h.valid(next.AccessToken, "notes"), "the family is revoked")

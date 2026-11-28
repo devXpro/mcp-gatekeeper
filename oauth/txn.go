@@ -20,7 +20,7 @@ type txn struct {
 	scope       string // the scope a grant gets
 	resource    core.ResourceID
 	resourceURL string // the resource's canonical RFC 8707 resource
-	startedFrom string // where the browser came from: startedAssistant, startedElsewhere or startedUnknown
+	startedFrom string // where the browser came from: startedAssistant, startedElsewhere, startedUnknown or startedApp
 	group       string // the client address group of authorize (addressKey)
 	binding     []byte // the sha256 of the browser's binding cookie; nil while binding is off
 	expiresAt   time.Time

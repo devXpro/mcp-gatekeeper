@@ -10,7 +10,8 @@
 //
 // The rules: only ChatGPT's and Claude's callbacks are accepted and they tell the assistant, PKCE S256 is required,
 // every secret, code and token is kept only as its sha256, and a refresh token is spent on use, so one that comes
-// back revokes its whole family.
+// back revokes its whole family. An application may also declare native apps of its own (Options.NativeApps), which
+// register by DCR with a loopback callback (RFC 8252) and are public clients under the same rules.
 //
 // A person acts only while core.Person.Active: the consent API, the code exchange and the refresh refuse anyone
 // disabled or past the end of their term (Person.AccessUntil), and an access token never outlives that end. The
@@ -51,6 +52,7 @@ const (
 	codeTTL        = 5 * time.Minute      // an authorization code
 	accessTTL      = time.Hour            // an access token
 	refreshTTL     = 30 * 24 * time.Hour  // a refresh token; each rotation issues a new one
+	refreshGrace   = time.Minute          // a refresh token replaced this recently is answered again, not reuse
 	grantTTL       = 180 * 24 * time.Hour // a grant, from its consent; refreshing never extends it (T2.R L7)
 	idleClientTTL  = time.Hour            // a DCR client without a grant is deleted after this (T2.R H2)
 	cimdCacheTTL   = 24 * time.Hour       // a fetched client ID metadata document is reused this long
@@ -117,6 +119,7 @@ const (
 	startedAssistant = "assistant"
 	startedElsewhere = "elsewhere"
 	startedUnknown   = "unknown"
+	startedApp       = "app" // a native app's request: the system browser it opens has no Referer to judge
 )
 
 // Audit actions and the detail key of a grant's resource. The key is Family Hub's "module": audit entries keep
@@ -185,6 +188,12 @@ type Options struct {
 	// RefuseConnectorCallback refuses ChatGPT's per-connector callback /connector/oauth/<id>, which closes the
 	// mix-up of T2.R H1. Family Hub: FH_OAUTH_CONNECTOR_CALLBACK=refuse.
 	RefuseConnectorCallback bool
+
+	// NativeApps are the application's own programs that may connect from the person's computer with a loopback
+	// redirect (RFC 8252), each by DCR with its ID as software_id. None (the default) changes nothing: only ChatGPT's
+	// and Claude's callbacks are accepted, with the same bytes. New refuses an ID that does not match
+	// ^[a-z][a-z0-9-]{1,30}$ or comes twice, and an empty or invisible Name.
+	NativeApps []NativeApp
 }
 
 // settings are the switches of Options, said the way the code asks them.
@@ -213,6 +222,8 @@ type Server struct {
 	metadata  []byte   // the authorization-server metadata document
 	cfg       settings // the switches of Options
 	badDoc    pageText // pageMetadataInvalid in the application's words
+
+	apps map[string]NativeApp // Options.NativeApps by ID; nil without any
 
 	txns       *txnStore
 	spent      *spentCodes
@@ -246,6 +257,10 @@ func newServer(o Options, f fetcher) (*Server, error) {
 	if err := o.check(); err != nil {
 		return nil, err
 	}
+	apps, err := nativeApps(o.NativeApps)
+	if err != nil {
+		return nil, err
+	}
 	metadata, err := serverMetadataJSON(issuer)
 	if err != nil {
 		return nil, err
@@ -277,6 +292,7 @@ func newServer(o Options, f fetcher) (*Server, error) {
 		metadata:       metadata,
 		cfg:            cfg,
 		badDoc:         metadataInvalidText(o.Brand),
+		apps:           apps,
 		txns:           newTxnStore(maxTxns, maxTxnsPerGroup, maxTxnsPerClient),
 		spent:          newSpentCodes(),
 		touched:        newThrottle(touchPeriod),

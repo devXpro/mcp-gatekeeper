@@ -70,6 +70,7 @@ func Run(t *testing.T, open Open) {
 		{"RevokeGrantsByResource", testRevokeGrantsByResource},
 		{"UseRefresh", testUseRefresh},
 		{"UseRefreshConcurrent", testUseRefreshConcurrent},
+		{"RefreshGrace", testRefreshGrace},
 		{"Purge", testPurge},
 		{"Audit", testAudit},
 		{"AuditLimits", testAuditLimits},

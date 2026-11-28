@@ -202,6 +202,11 @@ func (s *fakeStore) token(raw string) (core.Token, bool) {
 	return t, ok
 }
 
+func (s *fakeStore) tokenCount() int {
+	defer s.lock(context.Background())()
+	return len(s.data.tokens)
+}
+
 func (s *fakeStore) auditEntries() []core.AuditEntry {
 	defer s.lock(context.Background())()
 	return slices.Clone(s.data.audit)

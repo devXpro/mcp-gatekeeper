@@ -323,6 +323,7 @@ func TestRefreshReuseRevokesTheFamily(t *testing.T) {
 	var next tokens
 	decode(t, w, &next)
 
+	h.clock.advance(refreshGrace + time.Second)
 	w = h.refresh(tc, first.RefreshToken)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Equal(t, "invalid_grant", errorOf(t, w))
@@ -355,6 +356,7 @@ func TestRefreshReuseIsHandledWhenTheClientHangsUp(t *testing.T) {
 	var next tokens
 	decode(t, w, &next)
 
+	h.clock.advance(refreshGrace + time.Second)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {tk.RefreshToken}, "client_id": {tc.id}}
@@ -445,18 +447,146 @@ func TestRefreshRace(t *testing.T) {
 	tc := h.registerDCR(claudeCallback, authNone)
 	tk := h.connect(tc, "alice", "notes")
 	const n = 8
-	codes := make([]int, n)
+	answers := make([]*httptest.ResponseRecorder, n)
 	var wg sync.WaitGroup
 	for i := range n {
-		wg.Go(func() { codes[i] = h.refresh(tc, tk.RefreshToken).Code })
+		wg.Go(func() { answers[i] = h.refresh(tc, tk.RefreshToken) })
 	}
 	wg.Wait()
-	ok := 0
-	for _, c := range codes {
-		if c == http.StatusOK {
-			ok++
-		}
+	for _, w := range answers {
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		assert.Equal(t, answers[0].Body.String(), w.Body.String(), "of concurrent refreshes one rotates; the others "+
+			"get its answer again (the refresh grace)")
 	}
-	assert.Equal(t, 1, ok, "of concurrent refreshes one wins")
-	assert.Equal(t, n-1, h.store.auditActions()["oauth.refresh.reuse"], "the others are reuse")
+	assert.Zero(t, h.store.auditActions()["oauth.refresh.reuse"])
+	assert.Equal(t, 4, h.store.tokenCount(), "one rotation: two tokens of the exchange, two of the refresh")
+}
+
+// graceHarness connects a Claude client, refreshes once and returns the first tokens and the answer of the refresh.
+func graceHarness(t *testing.T) (*harness, testClient, tokens, *httptest.ResponseRecorder) {
+	t.Helper()
+	h := newHarness(t)
+	tc := h.registerDCR(claudeCallback, authNone)
+	first := h.connect(tc, "alice", "notes")
+	w := h.refresh(tc, first.RefreshToken)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	return h, tc, first, w
+}
+
+// TestRefreshGrace is review SR L5: a client whose refresh answer was lost presents the spent token again within
+// refreshGrace and gets the same tokens again instead of a revoked family.
+func TestRefreshGrace(t *testing.T) {
+	const graceLog = "oauth: a refresh token replaced moments ago came back from its client; the same tokens are answered"
+
+	t.Run("the lost answer is answered again", func(t *testing.T) {
+		h, tc, first, w := graceHarness(t)
+		var next tokens
+		decode(t, w, &next)
+		again := h.refresh(tc, first.RefreshToken)
+		assert.Equal(t, w.Code, again.Code)
+		assert.Equal(t, w.Header(), again.Header(), "the same headers")
+		assert.Equal(t, w.Body.String(), again.Body.String(), "the same answer, byte for byte")
+
+		h.clock.advance(refreshGrace)
+		again = h.refresh(tc, first.RefreshToken)
+		require.Equal(t, http.StatusOK, again.Code, again.Body.String())
+		var replay tokens
+		decode(t, again, &replay)
+		assert.Equal(t, next.AccessToken, replay.AccessToken)
+		assert.Equal(t, next.RefreshToken, replay.RefreshToken)
+		assert.Equal(t, int64(3600-60), replay.ExpiresIn, "what is left of the access token's hour")
+		assert.Equal(t, next.Scope, replay.Scope)
+		assert.True(t, h.valid(next.AccessToken, "notes"))
+		assert.Zero(t, h.store.auditActions()["oauth.refresh.reuse"])
+		assert.Len(t, h.logged(graceLog), 2)
+		assert.Equal(t, 4, h.store.tokenCount(), "nothing new was issued")
+
+		// The client goes on with the tokens it finally got.
+		w = h.refresh(tc, next.RefreshToken)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	})
+
+	t.Run("after the grace, reuse revokes the family", func(t *testing.T) {
+		h, tc, first, w := graceHarness(t)
+		var next tokens
+		decode(t, w, &next)
+		h.clock.advance(refreshGrace + time.Millisecond)
+		w = h.refresh(tc, first.RefreshToken)
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Equal(t, "invalid_grant", errorOf(t, w))
+		assert.False(t, h.valid(next.AccessToken, "notes"))
+		assert.Equal(t, http.StatusBadRequest, h.refresh(tc, next.RefreshToken).Code)
+		assert.Equal(t, 1, h.store.auditActions()["oauth.refresh.reuse"])
+		assert.Empty(t, h.logged(graceLog))
+	})
+
+	t.Run("once the replacement was used, the spent token is reuse", func(t *testing.T) {
+		h, tc, first, w := graceHarness(t)
+		var next tokens
+		decode(t, w, &next)
+		w = h.refresh(tc, next.RefreshToken)
+		require.Equal(t, http.StatusOK, w.Code)
+		var third tokens
+		decode(t, w, &third)
+		w = h.refresh(tc, first.RefreshToken)
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.False(t, h.valid(third.AccessToken, "notes"), "the family is revoked")
+		assert.Equal(t, 1, h.store.auditActions()["oauth.refresh.reuse"])
+	})
+
+	t.Run("once the replacement was revoked, the spent token is reuse", func(t *testing.T) {
+		h, tc, first, w := graceHarness(t)
+		var next tokens
+		decode(t, w, &next)
+		require.Equal(t, http.StatusOK, h.clientPost("/oauth/revoke", tc, url.Values{"token": {next.RefreshToken}}).Code)
+		w = h.refresh(tc, first.RefreshToken)
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Equal(t, 1, h.store.auditActions()["oauth.refresh.reuse"])
+	})
+
+	t.Run("another client gets nothing and revokes nothing", func(t *testing.T) {
+		h, _, first, w := graceHarness(t)
+		var next tokens
+		decode(t, w, &next)
+		other := h.registerDCR(claudeCallback, authNone)
+		w = h.refresh(other, first.RefreshToken)
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Equal(t, "invalid_grant", errorOf(t, w))
+		assert.True(t, h.valid(next.AccessToken, "notes"))
+		assert.Zero(t, h.store.auditActions()["oauth.refresh.reuse"])
+	})
+
+	t.Run("a revoked grant is not answered again", func(t *testing.T) {
+		h, tc, first, _ := graceHarness(t)
+		require.NoError(t, h.srv.RevokeGrant(t.Context(), h.store.grantList()[0].ID, alice.Person.ID, ""))
+		w := h.refresh(tc, first.RefreshToken)
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Equal(t, "invalid_grant", errorOf(t, w))
+	})
+
+	t.Run("a person who may no longer act is not answered again", func(t *testing.T) {
+		h := newHarness(t)
+		tc := h.registerDCR(claudeCallback, authNone)
+		first := h.connect(tc, "bob", "notes")
+		require.Equal(t, http.StatusOK, h.refresh(tc, first.RefreshToken).Code)
+		end := h.clock.now()
+		h.setTerm(bob.Person.ID, &end)
+		w := h.refresh(tc, first.RefreshToken)
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Equal(t, "invalid_grant", errorOf(t, w))
+		assert.Zero(t, h.store.auditActions()["oauth.refresh.reuse"])
+	})
+}
+
+func TestRotatedTokens(t *testing.T) {
+	rt := randomToken()
+	access, refresh := rotated(rt)
+	a2, r2 := rotated(rt)
+	assert.Equal(t, access, a2, "the same spent token rotates into the same tokens")
+	assert.Equal(t, refresh, r2)
+	assert.NotEqual(t, access, refresh)
+	assert.Regexp(t, opaquePattern, access)
+	assert.Regexp(t, opaquePattern, refresh)
+	other, _ := rotated(randomToken())
+	assert.NotEqual(t, access, other)
 }

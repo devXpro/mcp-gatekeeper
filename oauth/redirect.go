@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -112,4 +113,71 @@ func assistantName(a core.Assistant) string {
 		return "Claude"
 	}
 	return string(a)
+}
+
+// nativeCallbacks are the redirect URIs a native app registers (RFC 8252 §7.3): its loopback callback on the IPv4 or
+// the IPv6 loopback address, without a port. localhost is not one: a name can resolve elsewhere (RFC 8252 §8.3).
+var nativeCallbacks = []string{"http://127.0.0.1/oauth/callback", "http://[::1]/oauth/callback"}
+
+// nativeSet checks the redirect URIs of a native app's registration: 1 to 10, each one of nativeCallbacks. It
+// returns them without repeats.
+func nativeSet(uris []string) ([]string, bool) {
+	if len(uris) == 0 || len(uris) > maxRedirectURIs {
+		return nil, false
+	}
+	out := make([]string, 0, len(nativeCallbacks))
+	for _, raw := range uris {
+		if !slices.Contains(nativeCallbacks, raw) {
+			return nil, false
+		}
+		if !slices.Contains(out, raw) {
+			out = append(out, raw)
+		}
+	}
+	return out, true
+}
+
+// loopbackCallback returns the registered form of a native app's redirect URI raw: raw without its port, which is
+// whatever the app listens on for this one request (RFC 8252 §7.3). raw is http on 127.0.0.1 or [::1], with an
+// optional port of 1 to 65535 in plain digits, the path /oauth/callback, and no user, query or fragment, in the form
+// url.URL prints. ok is false for anything else.
+func loopbackCallback(raw string) (string, bool) {
+	if len(raw) > maxURLLen {
+		return "", false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "http" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" ||
+		u.RawPath != "" || u.String() != raw {
+		return "", false
+	}
+	host := u.Hostname()
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	if port := u.Port(); port != "" {
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port ||
+			u.Host != host+":"+port {
+			return "", false
+		}
+	} else if u.Host != host { // "127.0.0.1:" has an empty port
+		return "", false
+	}
+	registered := "http://" + host + u.Path
+	if !slices.Contains(nativeCallbacks, registered) {
+		return "", false
+	}
+	return registered, true
+}
+
+// loopbackPort is the port of a redirect URI loopbackCallback accepted: its own, or 80 without one (http's).
+func loopbackPort(raw string) int {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return 0
+	}
+	if u.Port() == "" {
+		return 80
+	}
+	n, _ := strconv.Atoi(u.Port())
+	return n
 }

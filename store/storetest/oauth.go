@@ -1,6 +1,8 @@
 package storetest
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -329,4 +331,57 @@ func testUseRefreshConcurrent(t *testing.T, open Open) {
 		return err
 	})
 	assertOneWinner(t, errs, core.ErrUsed)
+}
+
+// testRefreshGrace checks what the oauth package's refresh grace relies on (review SR L5): a rotated token keeps the
+// time of its first rotation however often it comes back, and of concurrent refresh transactions on one token,
+// whoever loses (core.ErrUsed) already sees the tokens the winner stored, so it can answer the same ones again.
+func testRefreshGrace(t *testing.T, open Open) {
+	ctx := t.Context()
+	s := open(t)
+	now := ms()
+	tk := core.Token{Hash: hash("spent"), GrantID: "grt_1", Kind: core.TokenRefresh, Family: "f", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}
+	require.NoError(t, s.OAuth().PutToken(ctx, tk))
+	_, err := s.OAuth().UseRefresh(ctx, tk.Hash, now)
+	require.NoError(t, err)
+	for _, later := range []time.Duration{time.Second, 30 * time.Second, time.Hour} {
+		_, err = s.OAuth().UseRefresh(ctx, tk.Hash, now.Add(later))
+		assert.ErrorIs(t, err, core.ErrUsed)
+	}
+	got, err := s.OAuth().GetToken(ctx, tk.Hash)
+	require.NoError(t, err)
+	require.NotNil(t, got.UsedAt)
+	assert.True(t, now.Equal(*got.UsedAt), "the first rotation's time stays: %v", got.UsedAt)
+
+	contested := core.Token{Hash: hash("contested"), GrantID: "grt_1", Kind: core.TokenRefresh, Family: "r", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}
+	require.NoError(t, s.OAuth().PutToken(ctx, contested))
+	next := core.Token{Hash: hash("next"), GrantID: "grt_1", Kind: core.TokenRefresh, Family: "r", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}
+	errs := race(16, func(int) error {
+		return s.Tx(ctx, func(ctx context.Context) error {
+			if _, err := s.OAuth().GetToken(ctx, contested.Hash); err != nil {
+				return err
+			}
+			_, err := s.OAuth().UseRefresh(ctx, contested.Hash, now)
+			switch {
+			case err == nil:
+				return s.OAuth().PutToken(ctx, next)
+			case !errors.Is(err, core.ErrUsed):
+				return err
+			}
+			got, err := s.OAuth().GetToken(ctx, next.Hash)
+			if err != nil {
+				return fmt.Errorf("a loser does not see the winner's token: %w", err)
+			}
+			if got.UsedAt != nil || got.RevokedAt != nil {
+				return fmt.Errorf("the winner's token is not live: %+v", got)
+			}
+			return nil
+		})
+	})
+	for _, err := range errs {
+		assert.NoError(t, err, "every loser sees the winner's token")
+	}
+	got, err = s.OAuth().GetToken(ctx, contested.Hash)
+	require.NoError(t, err)
+	assert.NotNil(t, got.UsedAt)
 }

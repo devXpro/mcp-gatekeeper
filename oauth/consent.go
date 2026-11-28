@@ -26,6 +26,14 @@ type txnView struct {
 	Resource       resourceView    `json:"resource"`
 	Account        accountView     `json:"account"`
 	AlreadyGranted bool            `json:"already_granted"`
+	App            *appView        `json:"app,omitempty"` // a native app's client only
+}
+
+// appView is the native app of a transaction, for the consent screen to name it ("Desk on your computer") next
+// to the client's own name.
+type appView struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 type resourceView struct {
@@ -77,6 +85,10 @@ func (s *Server) txnInfo(w http.ResponseWriter, r *http.Request) {
 	for _, tool := range call.info.Tools {
 		tools = append(tools, toolView{Name: tool.Name, Title: tool.Title, Access: tool.Access})
 	}
+	var app *appView
+	if a, ok := s.nativeApp(t.assistant); ok {
+		app = &appView{ID: a.ID, Name: a.Name}
+	}
 	noStore(w)
 	writeJSON(w, http.StatusOK, txnView{
 		Assistant:    t.assistant,
@@ -89,6 +101,7 @@ func (s *Server) txnInfo(w http.ResponseWriter, r *http.Request) {
 		},
 		Account:        accountView{ID: v.Account.ID, Name: v.Account.Name},
 		AlreadyGranted: err == nil && !grantExpired(g, s.now()),
+		App:            app,
 	})
 }
 
