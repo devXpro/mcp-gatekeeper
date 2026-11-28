@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -30,6 +31,7 @@ type tokenResponse struct {
 type tokenPair struct {
 	access, refresh, family string
 	expiresIn               int64
+	replay                  bool // the refresh grace answers a lost answer again
 }
 
 // token is POST /oauth/token: the authorization_code and refresh_token grants, form-urlencoded, for an
@@ -142,7 +144,13 @@ func (s *Server) exchangeCode(ctx context.Context, w http.ResponseWriter, client
 
 // refresh is the refresh_token grant. The token rotates: it is spent, and a new access and refresh token of the
 // same family are issued. A spent token that comes back revokes its family and is audited as oauth.refresh.reuse;
-// a dead one is invalid_grant. Rotating never extends the grant: once it outlived grantTTL, the refresh is
+// a dead one is invalid_grant.
+//
+// The refresh grace (review SR L5): a client whose answer was lost presents the token it just spent again. Within
+// refreshGrace of its rotation, while the tokens it was replaced by are untouched (the replacing refresh token
+// neither used nor revoked), that client gets the same answer again, not a revoked family: the new tokens are derived
+// from the spent one (rotated), so they can be told again without keeping them. After refreshGrace, or once the
+// replacement was used, the spent token is reuse as before. Rotating never extends the grant: once it outlived grantTTL, the refresh is
 // invalid_grant and the grant is revoked, and the person consents again.
 //
 // A person who is no longer active (disabled, or past the end of their term) gets invalid_grant too, after the
@@ -192,12 +200,18 @@ func (s *Server) refresh(ctx context.Context, w http.ResponseWriter, client core
 		if g.RevokedAt == nil && grantExpired(g, now) {
 			return errGrantExpired
 		}
+		var replay bool
 		if _, err := o.UseRefresh(ctx, hash, now); err != nil {
-			if errors.Is(err, core.ErrUsed) {
+			if !errors.Is(err, core.ErrUsed) {
+				return err
+			}
+			if out, replay, err = replayed(ctx, o, rt, now); err != nil {
+				return err
+			}
+			if !replay {
 				reused = t.Family
 				return errReused
 			}
-			return err
 		}
 		switch {
 		case g.RevokedAt != nil:
@@ -206,10 +220,11 @@ func (s *Server) refresh(ctx context.Context, w http.ResponseWriter, client core
 			return errTarget
 		}
 		person, err := s.activePerson(ctx, g, now)
-		if err != nil {
+		if err != nil || replay {
 			return err
 		}
-		p, err := issue(ctx, o, g.ID, t.Family, now, person.AccessUntil)
+		access, refresh := rotated(rt)
+		p, err := issueAs(ctx, o, g.ID, t.Family, now, person.AccessUntil, access, refresh)
 		if err != nil {
 			return err
 		}
@@ -218,6 +233,10 @@ func (s *Server) refresh(ctx context.Context, w http.ResponseWriter, client core
 	})
 	switch {
 	case err == nil:
+		if out.replay {
+			s.log.Info("oauth: a refresh token replaced moments ago came back from its client; the same tokens are "+
+				"answered", slog.String("grant", string(grant.ID)))
+		}
 	case errors.Is(err, errReused):
 		s.refreshReused(ctx, grant, client, reused, now, ip)
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "")
@@ -244,13 +263,18 @@ func (s *Server) refresh(ctx context.Context, w http.ResponseWriter, client core
 // refresh checks the person again, so a term the owner extends keeps the connection.
 func issue(ctx context.Context, o store.OAuthStore, g core.GrantID, family string, now time.Time, until *time.Time,
 ) (tokenPair, error) {
+	return issueAs(ctx, o, g, family, now, until, randomToken(), randomToken())
+}
+
+// issueAs is issue with the tokens given: a refresh's, rotated from the token it spends.
+func issueAs(ctx context.Context, o store.OAuthStore, g core.GrantID, family string, now time.Time, until *time.Time,
+	access, refresh string,
+) (tokenPair, error) {
 	end := now.Add(accessTTL)
 	if until != nil {
 		end = earlier(end, *until)
 	}
-	p := tokenPair{
-		access: randomToken(), refresh: randomToken(), family: family, expiresIn: int64(end.Sub(now) / time.Second),
-	}
+	p := tokenPair{access: access, refresh: refresh, family: family, expiresIn: int64(end.Sub(now) / time.Second)}
 	err := o.PutToken(ctx, core.Token{
 		Hash: hashOf(p.access), GrantID: g, Kind: core.TokenAccess, Family: family, CreatedAt: now, ExpiresAt: end,
 	})
@@ -265,6 +289,54 @@ func issue(ctx context.Context, o store.OAuthStore, g core.GrantID, family strin
 		return tokenPair{}, err
 	}
 	return p, nil
+}
+
+// rotated returns the access and refresh token a refresh with the refresh token rt issues: HMAC-SHA256 keyed with rt,
+// so only who holds rt can work them out, and they look like any random token. That lets the refresh grace answer a
+// spent rt again with the same tokens, while the store keeps only hashes.
+func rotated(rt string) (access, refresh string) {
+	derive := func(label string) string {
+		m := hmac.New(sha256.New, []byte(rt))
+		m.Write([]byte(label))
+		return base64.RawURLEncoding.EncodeToString(m.Sum(nil))
+	}
+	return derive("mcp-gatekeeper refresh: access"), derive("mcp-gatekeeper refresh: refresh")
+}
+
+// replayed is the refresh grace: the tokens the spent refresh token rt was rotated into, when that happened at most
+// refreshGrace before now and they are untouched (the refresh token live and never used, the access token live).
+// ok is false otherwise, and the caller treats rt as reuse.
+func replayed(ctx context.Context, o store.OAuthStore, rt string, now time.Time) (tokenPair, bool, error) {
+	spent, err := o.GetToken(ctx, hashOf(rt))
+	if err != nil {
+		return tokenPair{}, false, err
+	}
+	if spent.UsedAt == nil || now.Sub(*spent.UsedAt) > refreshGrace {
+		return tokenPair{}, false, nil
+	}
+	access, refresh := rotated(rt)
+	untouched := func(raw string, kind core.TokenKind) (core.Token, bool, error) {
+		t, err := o.GetToken(ctx, hashOf(raw))
+		switch {
+		case errors.Is(err, core.ErrNotFound):
+			return core.Token{}, false, nil
+		case err != nil:
+			return core.Token{}, false, err
+		}
+		return t, t.Kind == kind && t.GrantID == spent.GrantID && t.Family == spent.Family && t.UsedAt == nil &&
+			t.RevokedAt == nil && t.ExpiresAt.After(now), nil
+	}
+	if _, ok, err := untouched(refresh, core.TokenRefresh); !ok || err != nil {
+		return tokenPair{}, false, err
+	}
+	a, ok, err := untouched(access, core.TokenAccess)
+	if !ok || err != nil {
+		return tokenPair{}, false, err
+	}
+	return tokenPair{
+		access: access, refresh: refresh, family: spent.Family, expiresIn: int64(a.ExpiresAt.Sub(now) / time.Second),
+		replay: true,
+	}, true, nil
 }
 
 // issued answers a token request with p.

@@ -52,6 +52,7 @@ const (
 	codeTTL        = 5 * time.Minute      // an authorization code
 	accessTTL      = time.Hour            // an access token
 	refreshTTL     = 30 * 24 * time.Hour  // a refresh token; each rotation issues a new one
+	refreshGrace   = time.Minute          // a refresh token replaced this recently is answered again, not reuse
 	grantTTL       = 180 * 24 * time.Hour // a grant, from its consent; refreshing never extends it (T2.R L7)
 	idleClientTTL  = time.Hour            // a DCR client without a grant is deleted after this (T2.R H2)
 	cimdCacheTTL   = 24 * time.Hour       // a fetched client ID metadata document is reused this long

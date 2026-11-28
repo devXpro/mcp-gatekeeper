@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -91,11 +92,12 @@ func TestFullFlow(t *testing.T) {
 	assert.True(t, h.valid(claudeTokens.AccessToken, "photos"))
 	assert.False(t, h.valid(claudeTokens.AccessToken, "notes"))
 
-	// ChatGPT refreshes; its old refresh token coming back revokes the family.
+	// ChatGPT refreshes; its old refresh token coming back after the refresh grace revokes the family.
 	refreshed := c.token(chatgpt, url.Values{"grant_type": {"refresh_token"},
 		"refresh_token": {chatgptTokens.RefreshToken}}, http.StatusOK)
 	secrets = append(secrets, refreshed.AccessToken, refreshed.RefreshToken)
 	assert.True(t, h.valid(refreshed.AccessToken, "notes"))
+	h.clock.advance(refreshGrace + time.Second)
 	c.token(chatgpt, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {chatgptTokens.RefreshToken}},
 		http.StatusBadRequest)
 	assert.False(t, h.valid(refreshed.AccessToken, "notes"))
