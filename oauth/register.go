@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 
 	"github.com/devXpro/mcp-gatekeeper/core"
 )
@@ -15,7 +16,7 @@ type registration struct {
 	RedirectURIs            []string `json:"redirect_uris"`
 	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
 	ClientName              string   `json:"client_name"`
-	SoftwareID              string   `json:"software_id"` // a native app's ID; read only for loopback callbacks
+	SoftwareID              string   `json:"software_id"` // a native app's ID; read only for a native app's callbacks
 }
 
 // registered is the answer of a registration (RFC 7591 §3.2.1).
@@ -35,8 +36,9 @@ type registered struct {
 
 // register is POST /oauth/register, dynamic client registration (RFC 7591): only ChatGPT's or Claude's callbacks,
 // all of one assistant, and a secret, stored hashed, only for a client that asks for client_secret_post or
-// client_secret_basic. With Options.NativeApps, a native app may register too: its loopback callbacks only
-// (nativeSet), its ID as software_id, and no secret; its client's assistant is "app:<ID>". On the way it deletes the
+// client_secret_basic. With Options.NativeApps, a native app may register too: its loopback callbacks and the
+// <scheme>:/oauth/callback of its own Schemes only (nativeSet), its ID as software_id, and no secret; its client's
+// assistant is "app:<ID>". On the way it deletes the
 // DCR clients nobody approved within an hour. The audit gets one registration per client address group a minute
 // (T2.R L8); the log gets every one.
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
@@ -61,18 +63,17 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	}
 	uris, assistant, ok := callbackSet(req.RedirectURIs, s.cfg.connector)
 	var app NativeApp
+	var schemes []string
 	native := false
 	if !ok && s.apps != nil {
-		uris, native = nativeSet(req.RedirectURIs)
+		uris, schemes, native = nativeSet(req.RedirectURIs, func(scheme string) bool {
+			_, declared := s.schemeOwner(scheme)
+			return declared
+		})
 		ok = native
 	}
 	if !ok {
-		description := "only ChatGPT's or Claude's callbacks are accepted, 1 to 10 of one assistant"
-		if s.apps != nil {
-			description = "only ChatGPT's or Claude's callbacks, 1 to 10 of one assistant, or a native app's " +
-				nativeCallbacks[0] + " are accepted"
-		}
-		oauthError(w, http.StatusBadRequest, "invalid_redirect_uri", description)
+		oauthError(w, http.StatusBadRequest, "invalid_redirect_uri", s.badRedirects())
 		return
 	}
 	if native {
@@ -80,6 +81,13 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 			oauthError(w, http.StatusBadRequest, "invalid_client_metadata",
 				"software_id must name a native app of this "+s.app)
 			return
+		}
+		for _, scheme := range schemes {
+			if !slices.Contains(app.Schemes, scheme) {
+				oauthError(w, http.StatusBadRequest, "invalid_redirect_uri",
+					"the scheme "+scheme+" is not one of the native app "+app.ID+"'s")
+				return
+			}
 		}
 		assistant = core.Assistant(AppAssistantPrefix + app.ID)
 	}
@@ -143,4 +151,20 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	}
 	noStore(w)
 	writeJSON(w, http.StatusCreated, resp)
+}
+
+// badRedirects is the error_description of a registration whose redirect URIs are refused. Without native apps it is
+// v0.2.0's; with them it names the loopback callback, and a scheme callback when an app declares Schemes.
+func (s *Server) badRedirects() string {
+	if s.apps == nil {
+		return "only ChatGPT's or Claude's callbacks are accepted, 1 to 10 of one assistant"
+	}
+	for _, a := range s.apps {
+		if len(a.Schemes) > 0 {
+			return "only ChatGPT's or Claude's callbacks, 1 to 10 of one assistant, or a native app's " +
+				nativeCallbacks[0] + " or its own scheme's scheme:" + schemeCallbackPath + " are accepted"
+		}
+	}
+	return "only ChatGPT's or Claude's callbacks, 1 to 10 of one assistant, or a native app's " +
+		nativeCallbacks[0] + " are accepted"
 }

@@ -62,6 +62,16 @@ describe('the consent screen of a native app', () => {
     expect(screen.getByText(RETURN)).toBeInTheDocument()
   })
 
+  it('a scheme redirect: the app on this device, no loopback address', async () => {
+    serve({ ...nativeTxn('app'), client_name: 'Phone', redirect_host: '', app: { id: 'desk', name: 'Desk', scheme: 'com.example.desk' } })
+    expect(await screen.findByRole('heading', { level: 1, name: 'Desk на вашем устройстве просит доступ к «Дневник»' })).toBeInTheDocument()
+    const back = 'Ответ вернётся в приложение Desk на этом устройстве'
+    expect(screen.getByText(back)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Разрешить' })).toHaveAccessibleDescription(expect.stringContaining(back))
+    expect(screen.getByText('com.example.desk:')).toBeInTheDocument()
+    expect(screen.queryByText(/на этом компьютере/)).toBeNull()
+  })
+
   it('an assistant: no loopback line', async () => {
     serve({ ...nativeTxn('assistant'), assistant: 'chatgpt', client_name: 'ChatGPT', client_kind: 'cimd', redirect_host: 'chatgpt.com', app: undefined })
     expect(await screen.findByRole('heading', { level: 1, name: 'ChatGPT просит доступ к «Дневник»' })).toBeInTheDocument()

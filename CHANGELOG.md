@@ -6,6 +6,24 @@ API).
 
 ## [Unreleased]
 
+Everything new is optional: without a declared scheme, every answer is v0.3.0's, byte for byte, and toward
+assistants also with one (`TestAssistantsUnchangedByNativeApps` runs with a scheme declared too).
+
+### Added
+
+- **Private-use URI scheme redirects for native apps (RFC 8252 §7.1).** `oauth.NativeApp.Schemes`: lowercase
+  reverse-DNS schemes with at least one dot, e.g. `com.example.desk` (`New` refuses others and a scheme declared
+  twice, in one app or across apps). A client of the app may register `<scheme>:/oauth/callback` (exact: no
+  authority, no other path, no query or fragment) for its own schemes, next to its loopback callbacks; the same
+  `software_id`, `none` and PKCE S256 rules; authorize matches it exactly and only while the scheme is still declared;
+  `started_from` is unchanged. A registration refused with a scheme declared names the scheme callback in its
+  `error_description`.
+- The consent view's `app.scheme` when the redirect is a scheme callback (`redirect_host` is empty then).
+- **UI package:** for a scheme redirect the consent screen calls the client "<Name> on your device", says "Returns to
+  the <Name> app on this device" next to Allow (`consent.native.device`, `consent.native.scheme`, EN and RU), shows
+  `<scheme>:` in the Returns to row, and approve may navigate to that scheme's callback only, for a native app only
+  (`returnable`, now in `lib/consent.ts`).
+
 ## [0.3.0] - 2026-11-28
 
 Everything new is optional: without declared native apps, every answer toward assistants and the SPA is v0.2.0's,

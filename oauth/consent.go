@@ -30,10 +30,12 @@ type txnView struct {
 }
 
 // appView is the native app of a transaction, for the consent screen to name it ("Desk on your computer") next
-// to the client's own name.
+// to the client's own name. Scheme is the private-use URI scheme of the redirect when it is one (the screen says
+// the answer returns to the app on this device), absent for a loopback redirect.
 type appView struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Scheme string `json:"scheme,omitempty"`
 }
 
 type resourceView struct {
@@ -88,6 +90,7 @@ func (s *Server) txnInfo(w http.ResponseWriter, r *http.Request) {
 	var app *appView
 	if a, ok := s.nativeApp(t.assistant); ok {
 		app = &appView{ID: a.ID, Name: a.Name}
+		app.Scheme, _ = schemeCallback(t.redirectURI)
 	}
 	noStore(w)
 	writeJSON(w, http.StatusOK, txnView{

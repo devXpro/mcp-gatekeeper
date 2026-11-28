@@ -37,6 +37,12 @@ oauth.New(oauth.Options{ /* ... */ NativeApps: []oauth.NativeApp{{ID: "desk", Na
 - The consent screen calls it "Desk on your computer" with the client's name in the App row and the loopback address
   next to Allow. It skips the "not opened from the assistant" warning only when the app opened the system browser
   itself (`Sec-Fetch-Site: none`, no `Referer`: `started_from` is `app`); a link from a web page warns.
+- A phone app (or any app without a loopback listener) declares private-use URI schemes (RFC 8252 §7.1):
+  `oauth.NativeApp{ID: "desk", Name: "Desk", Schemes: []string{"com.example.desk"}}`. Its client may then register
+  `com.example.desk:/oauth/callback` (exactly: one slash, no authority, no query or fragment) next to the loopback
+  callbacks, with the same `software_id`, `none` and PKCE S256 rules, and authorize matches it byte for byte. A scheme
+  is a lowercase reverse-DNS name with at least one dot; `New` refuses others and a scheme declared twice. The consent
+  screen then calls the client "Desk on your device" and says "Returns to the Desk app on this device" next to Allow.
 - Refresh, for every client: a refresh token spent within the last 60 seconds that its own client presents again
   gets the same new tokens again (a lost answer no longer revokes the connection); later, it is reuse as before.
 

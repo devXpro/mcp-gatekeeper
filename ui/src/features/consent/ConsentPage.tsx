@@ -17,7 +17,7 @@ import { useLang } from '../../i18n'
 import { assistantName } from '../../lib/assistant'
 import { api, isApiError, isOffline, seg } from '../../lib/api'
 import { cn } from '../../lib/cn'
-import { isForeignTxn } from '../../lib/consent'
+import { isForeignTxn, returnable } from '../../lib/consent'
 import { errorText } from '../../lib/errors'
 import { quote } from '../../lib/format'
 import { spring } from '../../lib/motion'
@@ -166,19 +166,6 @@ function NotEnabled() {
   )
 }
 
-/**
- * returnable keeps the answer's redirect a plain https URL or, for a native app, its loopback callback on this
- * computer (RFC 8252): the window is never sent to anything else.
- */
-function returnable(url: string, native: boolean) {
-  try {
-    const u = new URL(url)
-    return u.protocol === 'https:' || (native && u.protocol === 'http:' && (u.hostname === '127.0.0.1' || u.hostname === '[::1]'))
-  } catch {
-    return false
-  }
-}
-
 function Consent({
   txnId,
   txn,
@@ -200,8 +187,10 @@ function Consent({
   const { withStepUp } = useStepUp()
   const [busy, setBusy] = useState<'approve' | 'deny'>()
   const [error, setError] = useState<string>()
-  // A native app is named with where it runs ("Desk on your computer"); the client's own name is in the App row.
-  const who = txn.app ? t('consent.native', { app: txn.app.name }) : assistantName(txn.assistant, txn.client_name)
+  // A native app is named with where it runs ("Desk on your computer"); the client's own name is in the App row. One
+  // that returns by its private-use scheme runs on a phone as well, so it is "on your device".
+  const scheme = txn.app?.scheme
+  const who = txn.app ? t(scheme ? 'consent.native.device' : 'consent.native', { app: txn.app.name }) : assistantName(txn.assistant, txn.client_name)
   const tools = txn.resource.tools ?? []
   const reads = tools.filter((x) => x.access !== 'write')
   const writes = tools.filter((x) => x.access === 'write')
@@ -221,7 +210,7 @@ function Consent({
         setBusy(undefined)
         return
       }
-      if (!res?.redirect_url || !returnable(res.redirect_url, !!txn.app)) throw new Error('no redirect')
+      if (!res?.redirect_url || !returnable(res.redirect_url, txn.app)) throw new Error('no redirect')
       onOutcome({ kind: kind === 'approve' ? 'approved' : 'denied', url: res.redirect_url })
       // A moment for the check to land, so the person sees the answer before the window goes back.
       await new Promise((r) => setTimeout(r, 450))
@@ -316,7 +305,7 @@ function Consent({
                 trailing={<span className="truncate">{txn.client_name || who}</span>}
               />
               <Row title={t('consent.family')} trailing={<span className="truncate">{txn.account.name}</span>} />
-              <Row title={t('consent.return_to')} trailing={<span className="truncate font-mono text-[15px]">{txn.redirect_host}</span>} />
+              <Row title={t('consent.return_to')} trailing={<span className="truncate font-mono text-[15px]">{scheme ? `${scheme}:` : txn.redirect_host}</span>} />
             </Section>
           </Rise>
         </div>
@@ -329,10 +318,10 @@ function Consent({
         aria-hidden={done || undefined}
       >
         <div className="mx-auto flex max-w-[448px] flex-col gap-1">
-          {/* A native app's answer goes to a loopback port: the address is said where the finger is (review SR M1). */}
+          {/* A native app's answer goes to a loopback port or its scheme: it is said where the finger is (review SR M1). */}
           {txn.app && (
             <p id="consent-return" className="px-2 pb-1 text-center type-footnote text-balance text-label-2">
-              {t('consent.native.return', { address: txn.redirect_host })}
+              {scheme ? t('consent.native.scheme', { app: txn.app.name }) : t('consent.native.return', { address: txn.redirect_host })}
             </p>
           )}
           {/* Always said, right where the finger is: a phished link is the one Allow that was not asked for (H1). */}

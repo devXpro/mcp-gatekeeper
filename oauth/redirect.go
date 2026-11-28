@@ -119,22 +119,45 @@ func assistantName(a core.Assistant) string {
 // the IPv6 loopback address, without a port. localhost is not one: a name can resolve elsewhere (RFC 8252 §8.3).
 var nativeCallbacks = []string{"http://127.0.0.1/oauth/callback", "http://[::1]/oauth/callback"}
 
-// nativeSet checks the redirect URIs of a native app's registration: 1 to 10, each one of nativeCallbacks. It
-// returns them without repeats.
-func nativeSet(uris []string) ([]string, bool) {
+// nativeSet checks the redirect URIs of a native app's registration: 1 to 10, each one of nativeCallbacks or a
+// private-use scheme callback (schemeCallback) whose scheme declared reports as a NativeApp scheme. It returns them
+// without repeats, with the schemes of the scheme callbacks among them.
+func nativeSet(uris []string, declared func(scheme string) bool) ([]string, []string, bool) {
 	if len(uris) == 0 || len(uris) > maxRedirectURIs {
-		return nil, false
+		return nil, nil, false
 	}
-	out := make([]string, 0, len(nativeCallbacks))
+	out := make([]string, 0, len(uris))
+	var schemes []string
 	for _, raw := range uris {
-		if !slices.Contains(nativeCallbacks, raw) {
-			return nil, false
+		if scheme, ok := schemeCallback(raw); ok {
+			if !declared(scheme) {
+				return nil, nil, false
+			}
+			if !slices.Contains(schemes, scheme) {
+				schemes = append(schemes, scheme)
+			}
+		} else if !slices.Contains(nativeCallbacks, raw) {
+			return nil, nil, false
 		}
 		if !slices.Contains(out, raw) {
 			out = append(out, raw)
 		}
 	}
-	return out, true
+	return out, schemes, true
+}
+
+// schemeCallbackPath is the path of a native app's private-use scheme callback.
+const schemeCallbackPath = "/oauth/callback"
+
+// schemeCallback returns the scheme of raw when raw is a native app's private-use URI scheme callback (RFC 8252
+// §7.1): exactly <scheme>:/oauth/callback, the scheme matching schemePattern, with no authority ("//"), query or
+// fragment. Registration and authorize compare it as it is, byte for byte.
+func schemeCallback(raw string) (string, bool) {
+	scheme, rest, ok := strings.Cut(raw, ":")
+	if !ok || rest != schemeCallbackPath || len(scheme) > maxSchemeLen || !schemePattern.MatchString(scheme) {
+		return "", false
+	}
+	return scheme, true
 }
 
 // loopbackCallback returns the registered form of a native app's redirect URI raw: raw without its port, which is
