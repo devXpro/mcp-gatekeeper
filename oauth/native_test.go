@@ -103,9 +103,11 @@ func TestLoopbackCallback(t *testing.T) {
 }
 
 func TestNativeSet(t *testing.T) {
-	got, ok := nativeSet([]string{nativeCallback, nativeCallbackV6, nativeCallback})
+	none := func(string) bool { return false }
+	got, schemes, ok := nativeSet([]string{nativeCallback, nativeCallbackV6, nativeCallback}, none)
 	assert.True(t, ok)
 	assert.Equal(t, []string{nativeCallback, nativeCallbackV6}, got, "without repeats")
+	assert.Empty(t, schemes)
 
 	eleven := make([]string, 11)
 	for i := range eleven {
@@ -118,7 +120,7 @@ func TestNativeSet(t *testing.T) {
 		"localhost":               {"http://localhost/oauth/callback"},
 		"an assistant's callback": {nativeCallback, claudeCallback},
 	} {
-		_, ok := nativeSet(uris)
+		_, _, ok := nativeSet(uris, none)
 		assert.False(t, ok, name)
 	}
 }
@@ -470,6 +472,7 @@ func TestAssistantsUnchangedByNativeApps(t *testing.T) {
 	without, with := run(newHarness(t)), run(newNativeHarness(t))
 	require.Len(t, without, 15)
 	assert.Equal(t, without, with)
+	assert.Equal(t, without, run(newSchemeHarness(t)), "and with an app that declares a scheme")
 	assert.Contains(t, without[2], `"started_from":"unknown"`)
 	assert.NotContains(t, strings.Join(without, "\n"), `"app"`)
 	assert.NotContains(t, strings.Join(without, "\n"), "software_id")

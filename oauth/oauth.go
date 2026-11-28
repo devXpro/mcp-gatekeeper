@@ -11,7 +11,8 @@
 // The rules: only ChatGPT's and Claude's callbacks are accepted and they tell the assistant, PKCE S256 is required,
 // every secret, code and token is kept only as its sha256, and a refresh token is spent on use, so one that comes
 // back revokes its whole family. An application may also declare native apps of its own (Options.NativeApps), which
-// register by DCR with a loopback callback (RFC 8252) and are public clients under the same rules.
+// register by DCR with a loopback or a private-use URI scheme callback (RFC 8252) and are public clients under the
+// same rules.
 //
 // A person acts only while core.Person.Active: the consent API, the code exchange and the refresh refuse anyone
 // disabled or past the end of their term (Person.AccessUntil), and an access token never outlives that end. The
@@ -189,10 +190,11 @@ type Options struct {
 	// mix-up of T2.R H1. Family Hub: FH_OAUTH_CONNECTOR_CALLBACK=refuse.
 	RefuseConnectorCallback bool
 
-	// NativeApps are the application's own programs that may connect from the person's computer with a loopback
-	// redirect (RFC 8252), each by DCR with its ID as software_id. None (the default) changes nothing: only ChatGPT's
-	// and Claude's callbacks are accepted, with the same bytes. New refuses an ID that does not match
-	// ^[a-z][a-z0-9-]{1,30}$ or comes twice, and an empty or invisible Name.
+	// NativeApps are the application's own programs that may connect from the person's computer or phone with a
+	// loopback or, with NativeApp.Schemes, a private-use URI scheme redirect (RFC 8252), each by DCR with its ID as
+	// software_id. None (the default) changes nothing: only ChatGPT's and Claude's callbacks are accepted, with the
+	// same bytes. New refuses an ID that does not match ^[a-z][a-z0-9-]{1,30}$ or comes twice, an empty or invisible
+	// Name, a bad or repeated port, and a scheme that is not a lowercase reverse-DNS name or comes twice.
 	NativeApps []NativeApp
 }
 

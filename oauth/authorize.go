@@ -90,12 +90,19 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 // assistant's client must name one of its callbacks exactly, and the callback rules are applied again, so a client
 // stored before RefuseConnectorCallback was set cannot use a per-connector callback either. A native app's client,
 // while its app is declared, names one of its loopback callbacks with any port (RFC 8252 §7.3), or one of the app's
-// Ports when it has them: scheme, host and path exact.
+// Ports when it has them: scheme, host and path exact. Or it names one of its private-use scheme callbacks exactly
+// (RFC 8252 §7.1), while the scheme is still among the app's Schemes.
 func (s *Server) redirectAllowed(client core.OAuthClient, redirectURI string) bool {
 	if _, native := NativeAppID(client.Assistant); native {
-		registered, ok := loopbackCallback(redirectURI)
 		app, declared := s.nativeApp(client.Assistant)
-		return ok && declared && slices.Contains(client.RedirectURIs, registered) &&
+		if !declared {
+			return false
+		}
+		if scheme, ok := schemeCallback(redirectURI); ok {
+			return slices.Contains(app.Schemes, scheme) && slices.Contains(client.RedirectURIs, redirectURI)
+		}
+		registered, ok := loopbackCallback(redirectURI)
+		return ok && slices.Contains(client.RedirectURIs, registered) &&
 			(len(app.Ports) == 0 || slices.Contains(app.Ports, loopbackPort(redirectURI)))
 	}
 	return slices.Contains(client.RedirectURIs, redirectURI) && callbackAssistant(redirectURI, s.cfg.connector) != ""

@@ -178,8 +178,11 @@ export interface ConsentTxn {
   already_granted: boolean
   started_from?: 'assistant' | 'elsewhere' | 'unknown' | 'app'
   client_kind?: 'dcr' | 'cimd'
-  /** a native app of the application (`assistant` is `app:<id>`): it returns to a loopback callback on this computer */
-  app?: { id: string; name: string }
+  /**
+   * a native app of the application (`assistant` is `app:<id>`): it returns to a loopback callback on this computer
+   * or, with `scheme`, to its private-use URI scheme callback `<scheme>:/oauth/callback` on this device (RFC 8252)
+   */
+  app?: { id: string; name: string; scheme?: string }
 }
 
 /** approve and deny */
