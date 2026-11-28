@@ -23,18 +23,22 @@ An application can let its own programs connect from the person's computer, next
 loopback redirect (RFC 8252). Without a declared app nothing changes, byte for byte.
 
 ```go
-oauth.New(oauth.Options{ /* ... */ NativeApps: []oauth.NativeApp{{ID: "desk", Name: "Desk"}}})
+oauth.New(oauth.Options{ /* ... */ NativeApps: []oauth.NativeApp{{ID: "desk", Name: "Desk", Ports: []int{8742}}}})
 ```
 
 - The app registers by DCR as a public client: `redirect_uris` exactly `["http://127.0.0.1/oauth/callback"]` (or
   `http://[::1]/oauth/callback`; never `localhost`, never a port), `software_id` its `ID`,
   `token_endpoint_auth_method` `none`, and a `client_name` such as the computer's name.
-- It authorizes with `redirect_uri` `http://127.0.0.1:<any port>/oauth/callback` and PKCE S256, then exchanges the
-  code with the same `redirect_uri`. Tokens, refresh and the resource are as for everyone.
+- It authorizes with `redirect_uri` `http://127.0.0.1:<port>/oauth/callback` and PKCE S256, then exchanges the
+  code with the same `redirect_uri`. Any port, or one of `Ports` when the app declares them. Tokens, refresh and the
+  resource are as for everyone.
 - Its client's `core.Assistant` is `app:<ID>` (`oauth.NativeAppID` reads it back): `AccessInfo.Assistant`, grants and
   the audit carry it, and the application maps it to its own label.
-- The consent screen calls it "Desk on your computer" with the client's name in the App row, and skips the
-  "not opened from the assistant" warning, which a system browser would always trip (`started_from` is `app`).
+- The consent screen calls it "Desk on your computer" with the client's name in the App row and the loopback address
+  next to Allow. It skips the "not opened from the assistant" warning only when the app opened the system browser
+  itself (`Sec-Fetch-Site: none`, no `Referer`: `started_from` is `app`); a link from a web page warns.
+- Refresh, for every client: a refresh token spent within the last 60 seconds that its own client presents again
+  gets the same new tokens again (a lost answer no longer revokes the connection); later, it is reuse as before.
 
 The rules in full are in [docs/security/G4.md](docs/security/G4.md#clients).
 

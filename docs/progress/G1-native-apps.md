@@ -51,3 +51,48 @@ Status: **done**, on branch `native-apps`, not tagged (the release tag is made b
 - The people/admin connection lists show a native client with `assistant` `app:<ID>` and its `client_name`;
   `assistantName` falls back to `client_name`, so they read fine, but there is no app-specific wording or icon yet
   (the application's admin card owns that).
+
+## Security-review fixes (card GF: review SR M1 and L5)
+
+Status: **done**, on branch `native-apps`, not tagged.
+
+- [x] M1: `started_from` is `app` only for a request with exactly one `Sec-Fetch-Site: none` and no `Referer`; any
+  other native request (cross-site, same-site, same-origin, no header, a Referer) is `elsewhere` and warns
+  (`TestNativeStartedFrom`, `TestNativeConsentPhishing`)
+- [x] M1: `NativeApp.Ports []int`, optional; when set the loopback redirect must use one of them (a port-less redirect
+  counts as 80); `New` refuses 0, over 65535 and repeats (`TestNativeAppPorts`, `TestNewRefusesBadNativeApps`)
+- [x] M1: the consent screen says "Returns to 127.0.0.1:<port> on this computer" next to Allow for a native app
+  (`consent.native.return`, EN and RU), Allow is described by it; component tests in
+  `ui/src/features/consent/consent.test.tsx`
+- [x] L5: the 60 s refresh grace for every client (`TestRefreshGrace`, `TestRotatedTokens`, `TestRefreshRace` now
+  expects every concurrent refresh to get the same answer); the conformance group `RefreshGrace` runs on SQLite and on
+  MongoDB (Docker, tag `integration`)
+- [x] CHANGELOG `[Unreleased]` (Added and Changed), docs/security/G4.md, README
+- [x] gofmt, go vet, golangci-lint (0 issues, also with `--build-tags integration` on `./store/...`),
+  `go test -race ./...`, the Mongo conformance under `-tags integration`; `npm run typecheck && npm run lint &&
+  npm test` (78 tests)
+
+### Decisions
+
+- **`Sec-Fetch-Site: none` strictly**, as the plan's decision says, not the review's wider variant (also accept a
+  cross-site navigation without Referer when the port is declared). An app that opens the authorize URL by
+  navigating its own loopback admin page therefore gets the red warning; it should hand the URL to the system browser
+  instead (`open`), which sends `none`. A missing header is `elsewhere` too.
+- **The grace needs no new store method.** To answer the same tokens again while keeping only hashes, the tokens of a
+  refresh are HMAC-SHA256 keyed with the spent refresh token; the grace recomputes them, checks the new refresh token
+  (same grant and family, unused, unrevoked, unexpired) and the access token (live), and answers them with what is
+  left of `expires_in`. What the stores must guarantee is in the conformance group `RefreshGrace`: the first
+  `UsedAt` stays (so the window cannot be stretched by replays), and a concurrent loser of `UseRefresh` inside `Tx`
+  already sees the winner's new token (SQLite serializes write transactions; MongoDB retries the loser after the
+  write conflict).
+- **What counts as "untouched".** Once the new refresh token was used (the client moved on) or revoked, the spent
+  one coming back is reuse even inside the minute. The grant, resource and person checks run for a replay as for a
+  refresh; a replay writes nothing, is logged at info and not audited.
+- **The grace applies to every client**, ChatGPT and Claude included: the only bytes that change are the answers in
+  that minute, which were `invalid_grant` plus a revoked family before.
+
+### Open points
+
+- The review's own residual of M1 stays: a link sent in a messenger and opened from there also reads as `app`. With
+  `Ports` declared, only the app's port can receive the code; the application should declare its port (the desk:
+  8742).
