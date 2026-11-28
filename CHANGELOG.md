@@ -6,6 +6,8 @@ API).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-28
+
 Everything new is optional: without declared native apps, every answer toward assistants and the SPA is v0.2.0's,
 byte for byte (`TestAssistantsUnchangedByNativeApps`, and the existing byte tests unchanged). The one exception is
 the refresh grace below, which applies to every client.
@@ -138,6 +140,7 @@ use.
 - `ui/`: the admin UI package.
 - Single-resource and per-resource MCP layouts (`core.SingleResource`, `core.PerResource`).
 
-[Unreleased]: https://github.com/devXpro/mcp-gatekeeper/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/devXpro/mcp-gatekeeper/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/devXpro/mcp-gatekeeper/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/devXpro/mcp-gatekeeper/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/devXpro/mcp-gatekeeper/releases/tag/v0.1.0
